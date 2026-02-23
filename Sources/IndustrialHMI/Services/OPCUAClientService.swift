@@ -48,7 +48,7 @@ class OPCUAClientService: ObservableObject {
         connectionState = .connecting
 
         // Single dispatch to opcuaQueue — ALL C work happens there.
-        try await withCheckedThrowingContinuation { (continuation: CheckedThrowingContinuation<Void, Error>) in
+        try await withCheckedThrowingContinuation { continuation in
             self.opcuaQueue.async { [weak self] in
                 let newClient = UA_Client_new()
                 let config    = UA_Client_getConfig(newClient)
