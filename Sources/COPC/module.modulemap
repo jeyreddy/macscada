@@ -1,0 +1,7 @@
+module COPC [system] {
+    header "/opt/homebrew/include/open62541/client.h"
+    header "/opt/homebrew/include/open62541/client_config_default.h"
+    header "/opt/homebrew/include/open62541/client_highlevel.h"
+    link "open62541"
+    export *
+}

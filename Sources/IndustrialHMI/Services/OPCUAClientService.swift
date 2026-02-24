@@ -4,6 +4,7 @@ import COPC
 @MainActor
 class OPCUAClientService: ObservableObject {
     @Published var connectionState: ConnectionState = .disconnected
+    @Published var isPolling: Bool = false
 
     // Accessed only on @MainActor for the nil-guard; the captured OpaquePointer
     // *value* is then passed into opcuaQueue blocks by value — never re-read from
@@ -44,7 +45,8 @@ class OPCUAClientService: ObservableObject {
     // MARK: - Connection Management
 
     func connect() async throws {
-        guard connectionState != .connected else { return }
+        // Bail out if already connected OR if a connect is already in flight (.connecting).
+        guard connectionState == .disconnected || connectionState == .error else { return }
         connectionState = .connecting
 
         // Single dispatch to opcuaQueue — ALL C work happens there.
@@ -79,6 +81,7 @@ class OPCUAClientService: ObservableObject {
     func disconnect() async {
         pollingTimer?.invalidate()
         pollingTimer = nil
+        isPolling = false
         tagCallbacks.removeAll()
 
         guard let clientToDisconnect = client else {
@@ -126,13 +129,22 @@ class OPCUAClientService: ObservableObject {
         }
     }
 
-    private func startPolling() {
+    func startPolling() {
+        guard pollingTimer == nil else { return }
         print("DEBUG: Starting polling timer")
         pollingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 await self?.pollTags()
             }
         }
+        isPolling = true
+    }
+
+    func pausePolling() {
+        pollingTimer?.invalidate()
+        pollingTimer = nil
+        isPolling = false
+        Logger.shared.info("Polling paused")
     }
 
     // All tag reads are batched into a single opcuaQueue block — one dispatch
@@ -151,6 +163,11 @@ class OPCUAClientService: ObservableObject {
                     continuation.resume()
                     return
                 }
+
+                // Process any pending network events (keepalives, incoming data).
+                // This is required to prevent the OPC-UA secure channel from expiring
+                // when the client sits idle between polls. Timeout = 0 → non-blocking.
+                UA_Client_run_iterate(capturedClient, 0)
 
                 var results: [(nodeId: String, value: TagValue, quality: TagQuality, timestamp: Date)] = []
 
@@ -282,22 +299,29 @@ class OPCUAClientService: ObservableObject {
                 } else {
                     nodeIdC = UA_NODEID_STRING_ALLOC(0, nodeId)
                 }
+                // FIX: nodeIdC may own heap memory (string NodeIds); always release it.
+                defer { UA_NodeId_clear(&nodeIdC) }
 
-                // Build browse request
+                // Build browse request.
+                // FIX: Allocate UA_BrowseDescription through the C library's allocator
+                // (UA_malloc) so that UA_BrowseRequest_clear can safely free it with
+                // UA_free — avoids the shallow bit-copy / mismatched-allocator bug.
                 var browseRequest = UA_BrowseRequest()
                 UA_BrowseRequest_init(&browseRequest)
                 browseRequest.requestedMaxReferencesPerNode = 0
 
-                var browseDesc = UA_BrowseDescription()
-                UA_BrowseDescription_init(&browseDesc)
-                UA_NodeId_copy(&nodeIdC, &browseDesc.nodeId)
-                browseDesc.resultMask      = UInt32(UA_BROWSERESULTMASK_ALL.rawValue)
-                browseDesc.browseDirection = UA_BROWSEDIRECTION_FORWARD
-                browseDesc.referenceTypeId = UA_NODEID_NUMERIC(0, UInt32(UA_NS0ID_HIERARCHICALREFERENCES))
-                browseDesc.includeSubtypes = true
+                guard let descPtr = UA_BrowseDescription_new() else {
+                    continuation.resume(throwing: OPCUAError.browseError("Memory allocation failed"))
+                    return
+                }
+                UA_NodeId_copy(&nodeIdC, &descPtr.pointee.nodeId)
+                descPtr.pointee.resultMask      = UInt32(UA_BROWSERESULTMASK_ALL.rawValue)
+                descPtr.pointee.browseDirection = UA_BROWSEDIRECTION_FORWARD
+                descPtr.pointee.referenceTypeId = UA_NODEID_NUMERIC(0, UInt32(UA_NS0ID_HIERARCHICALREFERENCES))
+                descPtr.pointee.includeSubtypes = true
 
-                browseRequest.nodesToBrowse = UnsafeMutablePointer<UA_BrowseDescription>.allocate(capacity: 1)
-                browseRequest.nodesToBrowse.initialize(to: browseDesc)
+                // descPtr is now owned by browseRequest; UA_BrowseRequest_clear will free it.
+                browseRequest.nodesToBrowse     = descPtr
                 browseRequest.nodesToBrowseSize = 1
 
                 var browseResponse = UA_Client_Service_browse(capturedClient, browseRequest)
