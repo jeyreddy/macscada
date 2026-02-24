@@ -9,8 +9,13 @@ class TagEngine: ObservableObject {
     @Published var tags: [String: Tag] = [:]
     @Published var tagCount: Int = 0
     
+    // MARK: - Callbacks
+
+    /// Called on the main actor whenever a tag value is updated (simulation or OPC-UA).
+    var onTagUpdated: ((Tag) -> Void)?
+
     // MARK: - Private Properties
-    
+
     private var subscriptions = Set<AnyCancellable>()
     private let historian: Historian?
     private var simulationTimer: Timer?
@@ -76,7 +81,10 @@ class TagEngine: ObservableObject {
                     )
                 }
             }
-            
+
+            // Notify observers (e.g. AlarmManager in simulation mode)
+            onTagUpdated?(tags[name]!)
+
             Logger.shared.debug("Updated tag: \(name)")
         }
     }
@@ -144,6 +152,23 @@ class TagEngine: ObservableObject {
     /// Simulate tag value changes for development
     func startSimulation() {
         guard simulationTimer == nil else { return }
+
+        // Seed default tags if none exist (no OPC-UA tags loaded yet)
+        if tags.isEmpty {
+            let seeds: [(String, TagValue, String)] = [
+                ("Temperature",  .analog(25.0),  "Simulated temperature sensor (°C)"),
+                ("Pressure",     .analog(101.3), "Simulated pressure sensor (kPa)"),
+                ("FlowRate",     .analog(45.0),  "Simulated flow meter (L/min)"),
+                ("Level",        .analog(60.0),  "Simulated tank level (%)"),
+                ("MotorSpeed",   .analog(1500.0),"Simulated motor speed (RPM)"),
+            ]
+            for (name, value, desc) in seeds {
+                addTag(Tag(name: name, nodeId: "sim:\(name)", value: value,
+                           quality: .good, description: desc))
+            }
+            Logger.shared.info("Simulation: seeded \(seeds.count) default tags")
+        }
+
         simulationTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self else { return }

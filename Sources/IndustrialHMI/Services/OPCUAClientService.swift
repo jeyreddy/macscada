@@ -410,6 +410,14 @@ class OPCUAClientService: ObservableObject {
     }
 }
 
+// MARK: - DataDriver Conformance
+
+extension OPCUAClientService: DataDriver {
+    var driverType: DriverType { .opcua }
+    var driverName: String { "OPC-UA" }
+    var isConnected: Bool { connectionState == .connected }
+}
+
 // MARK: - Error Types
 
 enum OPCUAError: Error, LocalizedError {

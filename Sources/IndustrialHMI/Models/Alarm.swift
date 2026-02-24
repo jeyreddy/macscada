@@ -22,7 +22,7 @@ struct Alarm: Identifiable, Codable {
         tagName: String,
         message: String,
         severity: AlarmSeverity,
-        state: AlarmState = .active,
+        state: AlarmState = .unacknowledgedActive,
         triggerTime: Date = Date(),
         value: Double? = nil
     ) {
@@ -34,21 +34,32 @@ struct Alarm: Identifiable, Codable {
         self.triggerTime = triggerTime
         self.value = value
     }
-    
-    // MARK: - Methods
-    
-    /// Acknowledge this alarm
-    mutating func acknowledge(by username: String) {
-        guard state == .active else { return }
-        self.state = .acknowledged
-        self.acknowledgedTime = Date()
-        self.acknowledgedBy = username
+
+    // MARK: - ISA-18.2 State Transitions
+
+    /// Operator acknowledges the alarm.
+    /// - UnackActive  → AckActive  (condition still on — stays visible)
+    /// - UnackRTN     → Normal     (fully resolved — leaves active list)
+    mutating func acknowledge(by username: String = "Operator") {
+        acknowledgedTime = Date()
+        acknowledgedBy   = username
+        switch state {
+        case .unacknowledgedActive:  state = .acknowledgedActive
+        case .unacknowledgedRTN:     state = .normal
+        default: break
+        }
     }
-    
-    /// Mark alarm as returned to normal
+
+    /// Process value has returned to normal range.
+    /// - UnackActive  → UnackRTN   (still needs ack — stays visible)
+    /// - AckActive    → Normal     (already acked — fully resolved, leaves active list)
     mutating func returnToNormal() {
-        self.state = .returnToNormal
-        self.returnToNormalTime = Date()
+        returnToNormalTime = Date()
+        switch state {
+        case .unacknowledgedActive:  state = .unacknowledgedRTN
+        case .acknowledgedActive:    state = .normal
+        default: break
+        }
     }
 }
 
@@ -141,21 +152,32 @@ enum AlarmSeverity: String, Codable, CaseIterable {
     }
 }
 
-// MARK: - Alarm State
+// MARK: - Alarm State  (ISA-18.2)
 
 enum AlarmState: String, Codable {
-    case active = "Active"
-    case acknowledged = "Acknowledged"
-    case returnToNormal = "Return to Normal"
-    case suppressed = "Suppressed"
-    
+    /// Condition present, operator has not yet acknowledged.
+    case unacknowledgedActive = "Unack Active"
+    /// Condition present, operator has acknowledged (alarm still on).
+    case acknowledgedActive   = "Ack Active"
+    /// Condition cleared, operator has not yet acknowledged the event.
+    case unacknowledgedRTN    = "Unack RTN"
+    /// Fully resolved — in history only, not shown in active list.
+    case normal               = "Normal"
+    case suppressed           = "Suppressed"
+
+    /// True when the operator still needs to press Ack.
     var requiresAction: Bool {
-        switch self {
-        case .active:
-            return true
-        case .acknowledged, .returnToNormal, .suppressed:
-            return false
-        }
+        self == .unacknowledgedActive || self == .unacknowledgedRTN
+    }
+
+    /// True when the alarm condition (process value) is currently out of range.
+    var conditionActive: Bool {
+        self == .unacknowledgedActive || self == .acknowledgedActive
+    }
+
+    /// True when this alarm should appear in the active alarm list.
+    var isVisible: Bool {
+        self != .normal && self != .suppressed
     }
 }
 
@@ -186,27 +208,15 @@ enum AlarmPriority: Int, Codable, CaseIterable {
 extension Alarm {
     static var samples: [Alarm] {
         [
-            Alarm(
-                tagName: "TANK_001.LEVEL_PV",
-                message: "Tank 1 level high (95.5%)",
-                severity: .warning,
-                state: .active,
-                value: 95.5
-            ),
-            Alarm(
-                tagName: "REACTOR_01.TEMP_PV",
-                message: "Reactor 1 temperature critical high (285.0°C)",
-                severity: .critical,
-                state: .acknowledged,
-                value: 285.0
-            ),
-            Alarm(
-                tagName: "COMPRESSOR_A.PRESSURE_PV",
-                message: "Compressor A discharge pressure low (85.0 PSI)",
-                severity: .warning,
-                state: .returnToNormal,
-                value: 85.0
-            )
+            Alarm(tagName: "TANK_001.LEVEL_PV",
+                  message: "Tank 1 level high (95.5%)",
+                  severity: .warning, state: .unacknowledgedActive, value: 95.5),
+            Alarm(tagName: "REACTOR_01.TEMP_PV",
+                  message: "Reactor 1 temperature critical high (285.0°C)",
+                  severity: .critical, state: .acknowledgedActive, value: 285.0),
+            Alarm(tagName: "COMPRESSOR_A.PRESSURE_PV",
+                  message: "Compressor A discharge pressure low (85.0 PSI)",
+                  severity: .warning, state: .unacknowledgedRTN, value: 85.0)
         ]
     }
 }

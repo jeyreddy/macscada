@@ -16,35 +16,60 @@ func diagLog(_ msg: String) {
     }
 }
 
+// MARK: - App Delegate
+
+class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Ensure we're registered as a regular (foreground) app
+        NSApp.setActivationPolicy(.regular)
+
+        // Try immediately, then again after SwiftUI finishes creating the window
+        bringMainWindowToFront()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.bringMainWindowToFront() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5)  { self.bringMainWindowToFront() }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        sender.windows.filter { $0.isMiniaturized }.forEach { $0.deminiaturize(nil) }
+        bringMainWindowToFront()
+        return true
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        bringMainWindowToFront()
+    }
+
+    func bringMainWindowToFront() {
+        NSApp.activate(ignoringOtherApps: true)
+        if let window = NSApp.windows.first(where: { $0.canBecomeMain }) {
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()   // bypasses normal z-order restrictions
+        }
+    }
+}
+
+// MARK: - App
+
 @main
 struct IndustrialHMIApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
     // MARK: - State Objects (Singleton Services)
-    
-    /// OPC-UA client service for industrial protocol communication
-    @StateObject private var opcuaService = OPCUAClientService()
-    
-    /// Central tag database for real-time process data
-    @StateObject private var tagEngine = TagEngine()
-    
-    /// Alarm detection and management system
-    @StateObject private var alarmManager = AlarmManager()
-    
+
+    /// Top-level service orchestrator — owns all drivers and databases
+    @StateObject private var dataService = DataService()
+
     // MARK: - App Lifecycle
-    
+
     var body: some Scene {
         WindowGroup {
             MainView()
-                .environmentObject(opcuaService)
-                .environmentObject(tagEngine)
-                .environmentObject(alarmManager)
+                .environmentObject(dataService)
+                .environmentObject(dataService.opcuaService)
+                .environmentObject(dataService.tagEngine)
+                .environmentObject(dataService.alarmManager)
+                .environmentObject(dataService.hmiScreenStore)
                 .frame(minWidth: 1200, minHeight: 800)
-                .onAppear {
-                    NSApp.activate(ignoringOtherApps: true)
-                    if let window = NSApp.windows.first {
-                        window.title = "Industrial HMI"
-                        window.makeKeyAndOrderFront(nil)
-                    }
-                }
         }
         .windowToolbarStyle(.unified)
         .commands {

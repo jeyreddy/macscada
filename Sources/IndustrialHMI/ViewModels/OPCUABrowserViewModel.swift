@@ -8,14 +8,11 @@ class OPCUABrowserViewModel: ObservableObject {
     @Published var rootNodes: [OPCUANode] = []
     @Published var flattenedNodes: [OPCUANode] = []
     @Published var selectedNode: OPCUANode?
-    @Published var monitoredItems: [MonitoredItem] = []
     @Published var searchText: String = ""
     @Published var isLoading: Bool = false
-    private var isBrowsing: Bool = false
     @Published var errorMessage: String?
-
-    @Published var serverConfig: ServerConfiguration = .default
     @Published var isConnected: Bool = false
+    @Published var serverConfig: ServerConfiguration = .default
 
     // MARK: - Private Properties
 
@@ -23,7 +20,11 @@ class OPCUABrowserViewModel: ObservableObject {
     private let tagEngine: TagEngine
     private let alarmManager: AlarmManager
     private var cancellables = Set<AnyCancellable>()
-    private var loadedNodes: [String: [OPCUANode]] = [:]  // Cache
+    private var loadedNodes: [String: [OPCUANode]] = [:]   // browse cache
+    private var isBrowsing: Bool = false
+
+    // Internal subscription registry (no UI — selected nodes go to TagEngine)
+    private var subscribedNodeIds: Set<String> = []
 
     // MARK: - Initialization
 
@@ -37,56 +38,91 @@ class OPCUABrowserViewModel: ObservableObject {
             .map { $0 == .connected }
             .assign(to: &$isConnected)
 
-        // Load nodes once when connection becomes active
-        opcuaService.$connectionState
-            .removeDuplicates()
-            .filter { $0 == .connected }
-            .first()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    print("DEBUG BROWSER: Connection ready, loading nodes")
-                    try? await Task.sleep(nanoseconds: 300_000_000)
-                    await self?.loadRootNodes()
+        if Configuration.simulationMode {
+            // Simulation: build virtual tree from TagEngine tags.
+            // Rebuild whenever tags are added/removed.
+            tagEngine.$tagCount
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    self?.loadSimulatedNodes()
                 }
-            }
-            .store(in: &cancellables)
+                .store(in: &cancellables)
+            loadSimulatedNodes()
+        } else {
+            // Real OPC-UA: load root nodes on every (re)connect
+            opcuaService.$connectionState
+                .removeDuplicates()
+                .filter { $0 == .connected }
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    Task { @MainActor [weak self] in
+                        print("DEBUG BROWSER: Connection ready, loading nodes")
+                        try? await Task.sleep(nanoseconds: 300_000_000)
+                        await self?.loadRootNodes()
+                        await self?.resubscribeTags()
+                    }
+                }
+                .store(in: &cancellables)
+        }
     }
 
-    // MARK: - Connection Management
+    // MARK: - Simulation Mode
 
-    func connect() async {
-        if opcuaService.connectionState == .connected {
-            isConnected = true
-            await loadRootNodes()
+    /// Build a virtual OPC-UA address space from the TagEngine's current tags.
+    /// Shows a "Simulation" folder (expanded by default) containing all tags as variable nodes.
+    func loadSimulatedNodes() {
+        let allTags = tagEngine.getAllTags()
+        guard !allTags.isEmpty else {
+            // Show empty-but-connected state: single placeholder folder
+            var folder = OPCUANode(
+                nodeId: "sim:root",
+                browseName: "Simulation",
+                displayName: "Simulation",
+                nodeClass: .object,
+                hasChildren: false,
+                parentId: nil,
+                level: 0
+            )
+            folder.isExpanded = true
+            rootNodes = [folder]
+            updateFlattenedNodes()
             return
         }
-        isLoading = true
-        errorMessage = nil
-        do {
-            try await opcuaService.connect()
-            await loadRootNodes()
-            Logger.shared.info("Connected to OPC-UA server")
-        } catch {
-            errorMessage = "Connection failed: \(error.localizedDescription)"
-            Logger.shared.error("Connection failed: \(error)")
+
+        let children: [OPCUANode] = allTags.map { tag in
+            OPCUANode(
+                nodeId: tag.nodeId,
+                browseName: tag.name,
+                displayName: tag.name,
+                nodeClass: .variable,
+                hasChildren: false,
+                parentId: "sim:root",
+                level: 1
+            )
         }
-        isLoading = false
+
+        var folder = OPCUANode(
+            nodeId: "sim:root",
+            browseName: "Simulation",
+            displayName: "Simulation",
+            nodeClass: .object,
+            hasChildren: true,
+            parentId: nil,
+            level: 0
+        )
+        folder.isExpanded = true
+        folder.children = children
+        rootNodes = [folder]
+        updateFlattenedNodes()
     }
 
-    func disconnect() async {
-        rootNodes = []
-        flattenedNodes = []
-        selectedNode = nil
-        loadedNodes.removeAll()
-        isConnected = false
-        Logger.shared.info("Browser cleared (connection still active)")
-    }
-
-    // MARK: - Browse Operations
+    // MARK: - Browse Operations (real OPC-UA)
 
     func loadRootNodes() async {
-        guard !isBrowsing else { diagLog("DIAG [ViewModel] Browse already in progress, skipping"); return }
+        guard !isBrowsing else {
+            diagLog("DIAG [ViewModel] Browse already in progress, skipping")
+            return
+        }
         isBrowsing = true
         defer { isBrowsing = false }
         isLoading = true
@@ -108,12 +144,14 @@ class OPCUABrowserViewModel: ObservableObject {
     }
 
     func toggleNodeExpansion(_ node: OPCUANode) async {
-        print("DEBUG: toggleNodeExpansion called for \(node.displayName), currently expanded=\(node.isExpanded)")
+        // Toggle the expanded flag on the matching node
         rootNodes = rootNodes.map { updateNodeRecursive($0, targetId: node.id) }
 
-        if let updatedNode = findNode(withNodeId: node.nodeId, in: rootNodes),
+        // If the node is now expanded and has no children loaded yet,
+        // fetch them (real OPC-UA only — simulation children are pre-loaded)
+        if !Configuration.simulationMode,
+           let updatedNode = findNode(withNodeId: node.nodeId, in: rootNodes),
            updatedNode.isExpanded && updatedNode.children.isEmpty {
-            print("DEBUG: Loading children for \(node.displayName)")
             await loadChildren(for: updatedNode)
         }
         updateFlattenedNodes()
@@ -123,7 +161,6 @@ class OPCUABrowserViewModel: ObservableObject {
         var updated = node
         if node.id == targetId {
             updated.isExpanded.toggle()
-            print("DEBUG: Toggled \(node.displayName) to expanded=\(updated.isExpanded)")
         }
         if !updated.children.isEmpty {
             updated.children = updated.children.map { updateNodeRecursive($0, targetId: targetId) }
@@ -141,18 +178,14 @@ class OPCUABrowserViewModel: ObservableObject {
 
     func loadChildren(for node: OPCUANode) async {
         if let cached = loadedNodes[node.nodeId] {
-            print("DEBUG: Using cached children for \(node.displayName)")
             updateNodeChildren(nodeId: node.id, children: cached)
             return
         }
         do {
-            print("DEBUG: Fetching children for \(node.displayName) with nodeId=\(node.nodeId)")
             let children = try await opcuaService.browseNode(nodeId: node.nodeId)
-            print("DEBUG: Fetched \(children.count) children for \(node.displayName)")
             loadedNodes[node.nodeId] = children
             updateNodeChildren(nodeId: node.id, children: children)
         } catch {
-            print("DEBUG: Error loading children: \(error)")
             errorMessage = "Failed to load children: \(error.localizedDescription)"
         }
     }
@@ -162,11 +195,11 @@ class OPCUABrowserViewModel: ObservableObject {
         updateFlattenedNodes()
     }
 
-    private func updateNodeChildrenRecursive(_ node: OPCUANode, targetId: String, children: [OPCUANode]) -> OPCUANode {
+    private func updateNodeChildrenRecursive(_ node: OPCUANode, targetId: String,
+                                             children: [OPCUANode]) -> OPCUANode {
         var updated = node
         if node.id == targetId {
             updated.children = children
-            print("DEBUG: Updated \(node.displayName) with \(children.count) children")
         } else if !updated.children.isEmpty {
             updated.children = updated.children.map {
                 updateNodeChildrenRecursive($0, targetId: targetId, children: children)
@@ -175,22 +208,15 @@ class OPCUABrowserViewModel: ObservableObject {
         return updated
     }
 
-    // MARK: - Monitored Items (synced to TagEngine + AlarmManager)
+    // MARK: - Add Node as Tag
 
-    func addToMonitoredItems(_ node: OPCUANode) async {
-        print("DEBUG MONITOR: Attempting to add \(node.displayName) with nodeId=\(node.nodeId)")
-        guard node.nodeClass == .variable else {
-            errorMessage = "Only variables can be monitored"
-            return
-        }
-        if monitoredItems.contains(where: { $0.nodeId == node.nodeId }) {
-            errorMessage = "Node already monitored"
-            return
-        }
+    /// Double-click (or context menu) on a variable node → add it to TagEngine + subscribe.
+    func addTagFromNode(_ node: OPCUANode) async {
+        guard node.nodeClass == .variable else { return }
 
-        let item = MonitoredItem(nodeId: node.nodeId, displayName: node.displayName)
+        // Avoid duplicates
+        guard !tagEngine.getAllTags().contains(where: { $0.nodeId == node.nodeId }) else { return }
 
-        // Create a Tag in TagEngine so it appears in Tags, Alarms, and Trends views
         let tag = Tag(
             name: node.displayName,
             nodeId: node.nodeId,
@@ -200,48 +226,61 @@ class OPCUABrowserViewModel: ObservableObject {
         )
         tagEngine.addTag(tag)
 
+        // In simulation mode, TagEngine's simulation timer will drive updates — no OPC-UA sub needed.
+        guard !Configuration.simulationMode else { return }
+
+        // Real mode: subscribe via OPC-UA for live updates
+        guard !subscribedNodeIds.contains(node.nodeId) else { return }
+        subscribedNodeIds.insert(node.nodeId)
+
+        let tagName    = node.displayName
+        let tagEngine  = self.tagEngine
+        let alarmMgr   = self.alarmManager
+
         do {
-            print("DEBUG MONITOR: Calling subscribe for \(node.nodeId)")
-
-            // Capture by value to avoid retain cycle
-            let tagName = node.displayName
-            let tagEngine = self.tagEngine
-            let alarmManager = self.alarmManager
-
-            try await opcuaService.subscribe(to: [item.nodeId]) { [weak self] nodeId, value, quality, timestamp in
+            try await opcuaService.subscribe(to: [node.nodeId]) { [weak self] nodeId, value, quality, timestamp in
                 Task { @MainActor in
-                    // Update the browser's monitored item panel
-                    self?.updateMonitoredItem(nodeId: nodeId, value: value, quality: quality, timestamp: timestamp)
-                    // Keep TagEngine in sync — this feeds Tags, Trends, and Alarm checking
                     tagEngine.updateTag(name: tagName, value: value, quality: quality, timestamp: timestamp)
                     if let updatedTag = tagEngine.getTag(named: tagName) {
-                        alarmManager.checkAlarms(for: updatedTag)
+                        alarmMgr.checkAlarms(for: updatedTag)
                     }
+                    _ = self  // retain self weakly
                 }
             }
-
-            monitoredItems.append(item)
-            Logger.shared.info("Added monitored item: \(node.displayName)")
-
+            Logger.shared.info("Browser: subscribed \(tagName)")
         } catch {
-            // Roll back the tag we just added if subscription failed
+            // Roll back if subscription failed
             tagEngine.removeTag(named: node.displayName)
-            errorMessage = "Failed to add monitored item: \(error.localizedDescription)"
+            subscribedNodeIds.remove(node.nodeId)
+            errorMessage = "Failed to subscribe: \(error.localizedDescription)"
         }
     }
 
-    func removeMonitoredItem(_ item: MonitoredItem) async {
-        monitoredItems.removeAll { $0.id == item.id }
-        // Remove the corresponding Tag so it disappears from Tags, Alarms, Trends
-        tagEngine.removeTag(named: item.displayName)
-        Logger.shared.info("Removed monitored item: \(item.displayName)")
-    }
+    // MARK: - Reconnect Recovery
 
-    private func updateMonitoredItem(nodeId: String, value: TagValue, quality: TagQuality, timestamp: Date) {
-        if let index = monitoredItems.firstIndex(where: { $0.nodeId == nodeId }) {
-            monitoredItems[index].currentValue = value
-            monitoredItems[index].quality = quality
-            monitoredItems[index].timestamp = timestamp
+    /// Re-subscribe all previously-added tags after a Stop → Start cycle.
+    private func resubscribeTags() async {
+        guard !subscribedNodeIds.isEmpty else { return }
+        Logger.shared.info("Browser: re-subscribing \(subscribedNodeIds.count) tag(s)")
+
+        let tagEngine = self.tagEngine
+        let alarmMgr  = self.alarmManager
+
+        for nodeId in subscribedNodeIds {
+            guard let tag = tagEngine.getAllTags().first(where: { $0.nodeId == nodeId }) else { continue }
+            let tagName = tag.name
+            do {
+                try await opcuaService.subscribe(to: [nodeId]) { nodeId, value, quality, timestamp in
+                    Task { @MainActor in
+                        tagEngine.updateTag(name: tagName, value: value, quality: quality, timestamp: timestamp)
+                        if let updatedTag = tagEngine.getTag(named: tagName) {
+                            alarmMgr.checkAlarms(for: updatedTag)
+                        }
+                    }
+                }
+            } catch {
+                Logger.shared.error("Re-subscribe failed for \(tagName): \(error)")
+            }
         }
     }
 

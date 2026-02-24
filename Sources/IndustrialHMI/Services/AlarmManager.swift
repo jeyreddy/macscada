@@ -1,219 +1,239 @@
 import Foundation
 import Combine
 
-/// Manages alarm detection, state tracking, and notifications
+/// ISA-18.2 compliant alarm manager.
+///
+/// activeAlarms contains only alarms that are VISIBLE to the operator:
+///   • .unacknowledgedActive  — condition on, not yet acked
+///   • .acknowledgedActive    — condition on, acked (still showing)
+///   • .unacknowledgedRTN     — condition cleared, acked needed
+///
+/// An alarm leaves activeAlarms (→ history only) when it reaches .normal:
+///   • UnackActive + Ack  → AckActive    (stays visible, condition still on)
+///   • AckActive  + RTN   → Normal       (removed — fully resolved)
+///   • UnackActive + RTN  → UnackRTN     (stays visible, needs ack)
+///   • UnackRTN   + Ack   → Normal       (removed — operator confirmed the event)
 @MainActor
 class AlarmManager: ObservableObject {
+
     // MARK: - Published Properties
-    
+
     @Published var activeAlarms: [Alarm] = []
     @Published var alarmHistory: [Alarm] = []
     @Published var alarmConfigs: [AlarmConfig] = []
     @Published var unacknowledgedCount: Int = 0
-    
-    // MARK: - Private Properties
-    
+
+    // MARK: - Private
+
+    /// Tracks the last known ISA-18.2 state per tag name.
     private var alarmStates: [String: AlarmState] = [:]
-    private var subscriptions = Set<AnyCancellable>()
-    
-    // MARK: - Initialization
-    
+
+    // MARK: - Init
+
     init() {
-        // Load sample alarm configurations
-        loadSampleConfigs()
-        Logger.shared.info("Alarm manager initialized with \(alarmConfigs.count) configurations")
+        Logger.shared.info("AlarmManager (ISA-18.2) initialized")
     }
-    
+
     // MARK: - Alarm Configuration
-    
-    /// Add new alarm configuration
+
     func addAlarmConfig(_ config: AlarmConfig) {
         alarmConfigs.append(config)
-        Logger.shared.info("Added alarm config for tag: \(config.tagName)")
+        Logger.shared.info("Added alarm config for: \(config.tagName)")
     }
-    
-    /// Remove alarm configuration
+
     func removeAlarmConfig(_ config: AlarmConfig) {
         alarmConfigs.removeAll { $0.id == config.id }
     }
-    
-    /// Update alarm configuration
+
     func updateAlarmConfig(_ config: AlarmConfig) {
-        if let index = alarmConfigs.firstIndex(where: { $0.id == config.id }) {
-            alarmConfigs[index] = config
+        if let i = alarmConfigs.firstIndex(where: { $0.id == config.id }) {
+            alarmConfigs[i] = config
         }
     }
-    
-    // MARK: - Alarm Detection
-    
-    /// Check tag value against configured alarm thresholds
+
+    // MARK: - Alarm Detection  (ISA-18.2 state machine)
+
     func checkAlarms(for tag: Tag) {
         guard let config = alarmConfigs.first(where: { $0.tagName == tag.name }),
               config.enabled,
               tag.quality == .good,
-              let value = tag.value.numericValue else {
-            return
-        }
-        
+              let value = tag.value.numericValue else { return }
+
         let (violated, severity, message) = config.checkViolation(value: value)
         let currentState = alarmStates[tag.name]
-        
-        if violated, let severity = severity, let message = message {
-            // Alarm condition is active
-            if currentState == nil || currentState == .returnToNormal {
-                // New alarm - create and trigger
-                let alarm = Alarm(
-                    tagName: tag.name,
-                    message: message,
-                    severity: severity,
-                    state: .active,
-                    value: value
-                )
-                
-                activeAlarms.append(alarm)
-                alarmHistory.append(alarm)
-                alarmStates[tag.name] = .active
-                unacknowledgedCount += 1
-                
-                // Trigger notifications
-                triggerAlarmNotification(alarm)
-                
-                Logger.shared.warning("ALARM: \(message)")
+
+        if violated, let severity, let message {
+            // ── Alarm condition is ACTIVE ──────────────────────────────────
+            switch currentState {
+            case nil, .normal:
+                // Fresh alarm
+                raiseAlarm(tagName: tag.name, message: message, severity: severity, value: value)
+
+            case .unacknowledgedRTN:
+                // Re-alarm: value went bad again before operator acked the RTN.
+                // Supersede the pending-ack RTN with a new Unack Active alarm.
+                removeFromActive(tagName: tag.name, state: .unacknowledgedRTN, toHistory: true)
+                raiseAlarm(tagName: tag.name, message: message, severity: severity, value: value)
+
+            default:
+                break   // already .unacknowledgedActive or .acknowledgedActive — no duplicate
             }
+
         } else {
-            // No violation - check for return to normal
-            if currentState == .active || currentState == .acknowledged {
-                returnToNormal(tagName: tag.name)
+            // ── Condition has CLEARED ──────────────────────────────────────
+            guard let currentState else { return }
+            if currentState.conditionActive {
+                transitionToRTN(tagName: tag.name)
             }
         }
     }
-    
-    /// Mark alarm as returned to normal
-    private func returnToNormal(tagName: String) {
-        if let index = activeAlarms.firstIndex(where: { $0.tagName == tagName && $0.state != .returnToNormal }) {
-            activeAlarms[index].returnToNormal()
-            alarmStates[tagName] = .returnToNormal
-            
-            Logger.shared.info("Alarm returned to normal: \(tagName)")
-            
-            // Remove from active alarms after delay
-            Task {
-                try? await Task.sleep(nanoseconds: 5_000_000_000) // 5 seconds
-                await MainActor.run {
-                    self.activeAlarms.removeAll { $0.tagName == tagName && $0.state == .returnToNormal }
-                }
-            }
-        }
-    }
-    
+
     // MARK: - Alarm Actions
-    
-    /// Acknowledge an alarm
+
+    /// Acknowledge a single alarm.
+    /// - UnackActive → AckActive  (stays in active list; condition still on)
+    /// - UnackRTN    → Normal     (leaves active list; fully resolved)
     func acknowledgeAlarm(_ alarm: Alarm, by username: String = "Operator") {
-        if let index = activeAlarms.firstIndex(where: { $0.id == alarm.id }) {
-            activeAlarms[index].acknowledge(by: username)
-            alarmStates[alarm.tagName] = .acknowledged
-            unacknowledgedCount = max(0, unacknowledgedCount - 1)
-            
-            Logger.shared.info("Alarm acknowledged by \(username): \(alarm.tagName)")
+        guard let idx = activeAlarms.firstIndex(where: { $0.id == alarm.id }),
+              activeAlarms[idx].state.requiresAction else { return }
+
+        activeAlarms[idx].acknowledge(by: username)
+        let updated = activeAlarms[idx]
+        syncHistory(updated)
+
+        switch updated.state {
+        case .acknowledgedActive:
+            alarmStates[alarm.tagName] = .acknowledgedActive
+            // Stays in activeAlarms — condition still present
+
+        case .normal:
+            alarmStates[alarm.tagName] = .normal
+            activeAlarms.remove(at: idx)    // fully resolved
+
+        default: break
         }
+
+        recalcUnackCount()
+        Logger.shared.info("Ack \(alarm.tagName) by \(username) → \(updated.state.rawValue)")
     }
-    
-    /// Acknowledge all active alarms
+
+    /// Acknowledge ALL visible alarms.
     func acknowledgeAllAlarms(by username: String = "Operator") {
-        for i in 0..<activeAlarms.count {
-            if activeAlarms[i].state == .active {
-                activeAlarms[i].acknowledge(by: username)
-                alarmStates[activeAlarms[i].tagName] = .acknowledged
-            }
+        for i in activeAlarms.indices {
+            guard activeAlarms[i].state.requiresAction else { continue }
+            activeAlarms[i].acknowledge(by: username)
+            syncHistory(activeAlarms[i])
+            alarmStates[activeAlarms[i].tagName] = activeAlarms[i].state
         }
-        
-        unacknowledgedCount = 0
+        // Remove any that reached .normal (were UnackRTN → Normal)
+        activeAlarms.removeAll { $0.state == .normal }
+        recalcUnackCount()
         Logger.shared.info("All alarms acknowledged by \(username)")
     }
-    
-    /// Clear alarm history
+
     func clearAlarmHistory() {
         alarmHistory.removeAll()
         Logger.shared.info("Alarm history cleared")
     }
-    
-    // MARK: - Filtering
-    
-    /// Get alarms by severity
-    func getAlarms(withSeverity severity: AlarmSeverity) -> [Alarm] {
-        return activeAlarms.filter { $0.severity == severity }
-    }
-    
-    /// Get unacknowledged alarms
+
+    // MARK: - Filtering helpers
+
     func getUnacknowledgedAlarms() -> [Alarm] {
-        return activeAlarms.filter { $0.state == .active }
+        activeAlarms.filter { $0.state.requiresAction }
     }
-    
-    /// Get alarms for specific tag
+
+    func getAlarms(withSeverity severity: AlarmSeverity) -> [Alarm] {
+        activeAlarms.filter { $0.severity == severity }
+    }
+
     func getAlarms(forTag tagName: String) -> [Alarm] {
-        return activeAlarms.filter { $0.tagName == tagName }
+        activeAlarms.filter { $0.tagName == tagName }
     }
-    
+
+    // MARK: - Statistics
+
+    func getStatistics() -> AlarmStatistics {
+        AlarmStatistics(
+            totalActive:     activeAlarms.count,
+            unacknowledged:  unacknowledgedCount,
+            critical:        activeAlarms.filter { $0.severity == .critical }.count,
+            warning:         activeAlarms.filter { $0.severity == .warning  }.count,
+            info:            activeAlarms.filter { $0.severity == .info     }.count,
+            totalHistory:    alarmHistory.count
+        )
+    }
+
+    // MARK: - Private helpers
+
+    private func raiseAlarm(tagName: String, message: String,
+                            severity: AlarmSeverity, value: Double) {
+        let alarm = Alarm(tagName: tagName, message: message,
+                          severity: severity, state: .unacknowledgedActive, value: value)
+        activeAlarms.append(alarm)
+        alarmHistory.append(alarm)
+        alarmStates[tagName] = .unacknowledgedActive
+        recalcUnackCount()
+        triggerAlarmNotification(alarm)
+        Logger.shared.warning("ALARM: \(message)")
+    }
+
+    /// Transition the alarm for tagName from conditionActive → RTN state.
+    private func transitionToRTN(tagName: String) {
+        guard let idx = activeAlarms.firstIndex(where: {
+            $0.tagName == tagName && $0.state.conditionActive
+        }) else { return }
+
+        activeAlarms[idx].returnToNormal()
+        let updated = activeAlarms[idx]
+        syncHistory(updated)
+
+        switch updated.state {
+        case .unacknowledgedRTN:
+            alarmStates[tagName] = .unacknowledgedRTN
+            // Stays visible — operator must still ack
+
+        case .normal:
+            alarmStates[tagName] = .normal
+            activeAlarms.remove(at: idx)    // AckActive→Normal: fully resolved
+            recalcUnackCount()
+
+        default: break
+        }
+
+        Logger.shared.info("RTN: \(tagName) → \(updated.state.rawValue)")
+    }
+
+    /// Remove a specific alarm from activeAlarms (superseded / re-alarmed).
+    private func removeFromActive(tagName: String, state: AlarmState, toHistory: Bool) {
+        guard let idx = activeAlarms.firstIndex(where: {
+            $0.tagName == tagName && $0.state == state
+        }) else { return }
+        if toHistory { syncHistory(activeAlarms[idx]) }
+        activeAlarms.remove(at: idx)
+        recalcUnackCount()
+    }
+
+    /// Sync an alarm's current state back into alarmHistory.
+    private func syncHistory(_ alarm: Alarm) {
+        if let hIdx = alarmHistory.firstIndex(where: { $0.id == alarm.id }) {
+            alarmHistory[hIdx] = alarm
+        }
+    }
+
+    /// Recompute unacknowledgedCount from activeAlarms.
+    private func recalcUnackCount() {
+        unacknowledgedCount = activeAlarms.filter { $0.state.requiresAction }.count
+    }
+
     // MARK: - Notifications
-    
-    /// Trigger alarm notification (audio/visual)
+
     private func triggerAlarmNotification(_ alarm: Alarm) {
-        // Visual notification (system notification)
         let notification = NSUserNotification()
         notification.title = "Process Alarm: \(alarm.severity.rawValue)"
         notification.informativeText = alarm.message
-        notification.soundName = alarm.severity.soundEnabled ? NSUserNotificationDefaultSoundName : nil
-        
+        notification.soundName = alarm.severity.soundEnabled
+            ? NSUserNotificationDefaultSoundName : nil
         NSUserNotificationCenter.default.deliver(notification)
-        
-        // Audio alert for critical alarms
-        if alarm.severity == .critical {
-            // NSSound.beep()
-        }
-    }
-    
-    // MARK: - Statistics
-    
-    /// Get alarm statistics
-    func getStatistics() -> AlarmStatistics {
-        let critical = activeAlarms.filter { $0.severity == .critical }.count
-        let warning = activeAlarms.filter { $0.severity == .warning }.count
-        let info = activeAlarms.filter { $0.severity == .info }.count
-        
-        return AlarmStatistics(
-            totalActive: activeAlarms.count,
-            unacknowledged: unacknowledgedCount,
-            critical: critical,
-            warning: warning,
-            info: info,
-            totalHistory: alarmHistory.count
-        )
-    }
-    
-    // MARK: - Development Helpers
-    
-    /// Load sample alarm configurations
-    private func loadSampleConfigs() {
-        // Alarm configurations are defined by the user from Alarms → Configurations.
-        // No sample configs loaded — alarmConfigs starts empty.
-    }
-    
-    /// Simulate alarm for testing
-    func simulateAlarm() {
-        let alarm = Alarm(
-            tagName: "TEST_TAG",
-            message: "Simulated test alarm",
-            severity: .warning,
-            state: .active,
-            value: 95.0
-        )
-        
-        activeAlarms.append(alarm)
-        alarmHistory.append(alarm)
-        unacknowledgedCount += 1
-        
-        triggerAlarmNotification(alarm)
     }
 }
 
@@ -226,14 +246,4 @@ struct AlarmStatistics {
     let warning: Int
     let info: Int
     let totalHistory: Int
-    
-    var description: String {
-        """
-        Active: \(totalActive) (Unack: \(unacknowledged))
-        Critical: \(critical)
-        Warning: \(warning)
-        Info: \(info)
-        History: \(totalHistory)
-        """
-    }
 }
