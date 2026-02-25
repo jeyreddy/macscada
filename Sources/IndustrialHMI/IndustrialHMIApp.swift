@@ -69,6 +69,7 @@ struct IndustrialHMIApp: App {
                 .environmentObject(dataService.tagEngine)
                 .environmentObject(dataService.alarmManager)
                 .environmentObject(dataService.hmiScreenStore)
+                .environmentObject(dataService.agentService)
                 .frame(minWidth: 1200, minHeight: 800)
         }
         .windowToolbarStyle(.unified)

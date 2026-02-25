@@ -7,6 +7,7 @@ struct MainView: View {
     @EnvironmentObject var opcuaService: OPCUAClientService
     @EnvironmentObject var tagEngine: TagEngine
     @EnvironmentObject var alarmManager: AlarmManager
+    @EnvironmentObject var agentService: AgentService
 
     // MARK: - State
 
@@ -43,6 +44,11 @@ struct MainView: View {
                     .opacity(selectedTab == .hmi ? 1 : 0)
                     .allowsHitTesting(selectedTab == .hmi)
 
+                AgentView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .opacity(selectedTab == .agent ? 1 : 0)
+                    .allowsHitTesting(selectedTab == .agent)
+
                 // On-demand views
                 Group {
                     switch selectedTab {
@@ -50,7 +56,7 @@ struct MainView: View {
                         AlarmListView()
                     case .settings:
                         SettingsView()
-                    case .monitor, .trends, .hmi:
+                    case .monitor, .trends, .hmi, .agent:
                         Color.clear  // handled by always-alive views above
                     }
                 }
@@ -60,6 +66,9 @@ struct MainView: View {
         }
         .onChange(of: selectedTab) { old, new in
             diagLog("DIAG [MainView] tab changed: \(old.rawValue) → \(new.rawValue)")
+        }
+        .onAppear {
+            agentService.navigateToTab = { tab in selectedTab = tab }
         }
     }
 
@@ -75,6 +84,7 @@ enum Tab: String, CaseIterable, Identifiable {
     case trends
     case alarms
     case hmi
+    case agent
     case settings
 
     var id: String { rawValue }
@@ -85,6 +95,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .trends:   return "Trends"
         case .alarms:   return "Alarms"
         case .hmi:      return "HMI Screens"
+        case .agent:    return "AI Agent"
         case .settings: return "Settings"
         }
     }
@@ -95,6 +106,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .trends:   return "chart.xyaxis.line"
         case .alarms:   return "exclamationmark.triangle"
         case .hmi:      return "rectangle.on.rectangle"
+        case .agent:    return "cpu.fill"
         case .settings: return "gear"
         }
     }

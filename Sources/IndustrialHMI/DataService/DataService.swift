@@ -12,6 +12,7 @@ class DataService: ObservableObject {
     let configDatabase: ConfigDatabase
     let timeSeriesDatabase: TimeSeriesDatabase
     let hmiScreenStore: HMIScreenStore
+    let agentService:   AgentService
     private(set) var drivers: [any DataDriver] = []
 
     @Published var isRunning: Bool = false
@@ -26,7 +27,13 @@ class DataService: ObservableObject {
         self.alarmManager       = alarms
         self.configDatabase     = ConfigDatabase()
         self.timeSeriesDatabase = TimeSeriesDatabase(tagEngine: engine)
-        self.hmiScreenStore     = HMIScreenStore()
+        let store               = HMIScreenStore()
+        self.hmiScreenStore     = store
+        self.agentService       = AgentService(
+            tagEngine:      engine,
+            alarmManager:   alarms,
+            hmiScreenStore: store,
+            opcuaService:   opcua)
         self.drivers            = [opcua, MQTTDriver(), ModbusDriver()]
 
         Logger.shared.info("DataService initialized with \(self.drivers.count) drivers")
