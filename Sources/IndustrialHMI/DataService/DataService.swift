@@ -22,6 +22,9 @@ class DataService: ObservableObject {
         let engine = TagEngine()
         let alarms = AlarmManager()
 
+        // Wire historian from TagEngine into AlarmManager so both share the same DB.
+        alarms.historian = engine.historian
+
         self.opcuaService       = opcua
         self.tagEngine          = engine
         self.alarmManager       = alarms
@@ -37,6 +40,9 @@ class DataService: ObservableObject {
         self.drivers            = [opcua, MQTTDriver(), ModbusDriver()]
 
         Logger.shared.info("DataService initialized with \(self.drivers.count) drivers")
+
+        // Restore alarm configs and history from SQLite
+        Task { await alarms.loadFromDB() }
     }
 
     // MARK: - Data Collection
@@ -53,9 +59,12 @@ class DataService: ObservableObject {
             do {
                 try await opcuaService.connect()
                 Logger.shared.info("OPC-UA connection ready")
+                opcuaService.startAutoReconnect()
             } catch {
                 isRunning = false
                 Logger.shared.error("Connection failed: \(error)")
+                // Even on initial failure, start reconnect loop
+                opcuaService.startAutoReconnect()
             }
         }
     }
@@ -66,6 +75,7 @@ class DataService: ObservableObject {
         if Configuration.simulationMode {
             tagEngine.stopSimulation()
         } else {
+            opcuaService.stopAutoReconnect()
             await opcuaService.disconnect()
         }
     }

@@ -19,6 +19,7 @@ class OPCUAClientService: ObservableObject {
     private let opcuaQueue = DispatchQueue(label: "com.industrialhmi.opcua", qos: .userInitiated)
 
     private var tagCallbacks: [String: [(String, TagValue, TagQuality, Date) -> Void]] = [:]
+    private var reconnectTask: Task<Void, Never>?
 
     enum ConnectionState: String {
         case disconnected = "Disconnected"
@@ -107,6 +108,43 @@ class OPCUAClientService: ObservableObject {
         }
 
         Logger.shared.info("OPC-UA disconnected safely")
+    }
+
+    // MARK: - Auto-Reconnect
+
+    /// Start an exponential-backoff reconnect loop.
+    /// Safe to call multiple times — cancels any existing loop first.
+    func startAutoReconnect() {
+        reconnectTask?.cancel()
+        reconnectTask = Task { @MainActor [weak self] in
+            let delays: [Double] = [5, 10, 30, 60, 120]
+            var attempt = 0
+            while !Task.isCancelled {
+                // Wait for .disconnected or .error state before trying
+                guard let self else { return }
+                if self.connectionState == .connected {
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)  // check every 5 s
+                    continue
+                }
+                let delay = delays[min(attempt, delays.count - 1)]
+                Logger.shared.info("OPC-UA reconnect attempt \(attempt + 1) in \(Int(delay))s")
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                do {
+                    try await self.connect()
+                    attempt = 0   // reset backoff on success
+                    Logger.shared.info("OPC-UA auto-reconnect succeeded")
+                } catch {
+                    attempt += 1
+                    Logger.shared.warning("OPC-UA reconnect failed: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    func stopAutoReconnect() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
     }
 
     // MARK: - Subscription Management

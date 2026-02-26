@@ -67,6 +67,43 @@ struct HMIDesignerView: View {
 
     private var toolbarRow: some View {
         HStack(spacing: 12) {
+            // ── Screen picker ────────────────────────────────────────────────
+            if !hmiScreenStore.allScreenMeta.isEmpty {
+                Picker("Screen", selection: Binding(
+                    get: { hmiScreenStore.currentScreenId ?? hmiScreenStore.allScreenMeta.first!.id },
+                    set: { hmiScreenStore.switchToScreen(id: $0) }
+                )) {
+                    ForEach(hmiScreenStore.allScreenMeta) { meta in
+                        Text(meta.name).tag(meta.id)
+                    }
+                }
+                .frame(maxWidth: 160)
+                .help("Switch screen")
+            }
+
+            // Add screen
+            Button {
+                hmiScreenStore.createScreen()
+            } label: {
+                Image(systemName: "plus.rectangle")
+            }
+            .buttonStyle(.bordered)
+            .help("New screen")
+
+            // Delete current screen
+            Button {
+                if let id = hmiScreenStore.currentScreenId {
+                    hmiScreenStore.deleteScreen(id: id)
+                }
+            } label: {
+                Image(systemName: "trash.slash")
+            }
+            .buttonStyle(.bordered)
+            .disabled(hmiScreenStore.allScreenMeta.count <= 1)
+            .help("Delete current screen")
+
+            Divider().frame(height: 22)
+
             // Edit / Run toggle
             Picker("Mode", selection: $isEditMode) {
                 Label("Edit", systemImage: "pencil").tag(true)

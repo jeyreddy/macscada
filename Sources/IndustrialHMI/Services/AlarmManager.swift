@@ -23,6 +23,10 @@ class AlarmManager: ObservableObject {
     @Published var alarmConfigs: [AlarmConfig] = []
     @Published var unacknowledgedCount: Int = 0
 
+    // MARK: - Historian (injected by DataService)
+
+    var historian: Historian? = nil
+
     // MARK: - Private
 
     /// Tracks the last known ISA-18.2 state per tag name.
@@ -34,21 +38,51 @@ class AlarmManager: ObservableObject {
         Logger.shared.info("AlarmManager (ISA-18.2) initialized")
     }
 
+    // MARK: - Bootstrap from DB
+
+    func loadFromDB() async {
+        guard let h = historian else { return }
+        do {
+            let savedConfigs = try await h.loadAlarmConfigs()
+            alarmConfigs = savedConfigs
+            Logger.shared.info("AlarmManager: loaded \(savedConfigs.count) alarm configs from DB")
+
+            let history = try await h.loadAlarmHistory()
+            alarmHistory = history
+            Logger.shared.info("AlarmManager: loaded \(history.count) alarm history records from DB")
+
+            let active = try await h.loadActiveAlarms()
+            activeAlarms = active
+            for alarm in active {
+                alarmStates[alarm.tagName] = alarm.state
+            }
+            recalcUnackCount()
+            Logger.shared.info("AlarmManager: restored \(active.count) active alarms from DB")
+        } catch {
+            Logger.shared.error("AlarmManager: failed to load from DB — \(error)")
+        }
+    }
+
     // MARK: - Alarm Configuration
 
     func addAlarmConfig(_ config: AlarmConfig) {
         alarmConfigs.append(config)
         Logger.shared.info("Added alarm config for: \(config.tagName)")
+        persistConfig(config)
     }
 
     func removeAlarmConfig(_ config: AlarmConfig) {
         alarmConfigs.removeAll { $0.id == config.id }
+        if let h = historian {
+            Task { try? await h.deleteAlarmConfig(id: config.id) }
+        }
     }
 
     func updateAlarmConfig(_ config: AlarmConfig) {
         if let i = alarmConfigs.firstIndex(where: { $0.id == config.id }) {
             alarmConfigs[i] = config
         }
+        persistConfig(config)
     }
 
     // MARK: - Alarm Detection  (ISA-18.2 state machine)
@@ -66,17 +100,14 @@ class AlarmManager: ObservableObject {
             // ── Alarm condition is ACTIVE ──────────────────────────────────
             switch currentState {
             case nil, .normal:
-                // Fresh alarm
                 raiseAlarm(tagName: tag.name, message: message, severity: severity, value: value)
 
             case .unacknowledgedRTN:
-                // Re-alarm: value went bad again before operator acked the RTN.
-                // Supersede the pending-ack RTN with a new Unack Active alarm.
                 removeFromActive(tagName: tag.name, state: .unacknowledgedRTN, toHistory: true)
                 raiseAlarm(tagName: tag.name, message: message, severity: severity, value: value)
 
             default:
-                break   // already .unacknowledgedActive or .acknowledgedActive — no duplicate
+                break
             }
 
         } else {
@@ -90,9 +121,6 @@ class AlarmManager: ObservableObject {
 
     // MARK: - Alarm Actions
 
-    /// Acknowledge a single alarm.
-    /// - UnackActive → AckActive  (stays in active list; condition still on)
-    /// - UnackRTN    → Normal     (leaves active list; fully resolved)
     func acknowledgeAlarm(_ alarm: Alarm, by username: String = "Operator") {
         guard let idx = activeAlarms.firstIndex(where: { $0.id == alarm.id }),
               activeAlarms[idx].state.requiresAction else { return }
@@ -100,15 +128,15 @@ class AlarmManager: ObservableObject {
         activeAlarms[idx].acknowledge(by: username)
         let updated = activeAlarms[idx]
         syncHistory(updated)
+        persistAlarmUpdate(updated)
 
         switch updated.state {
         case .acknowledgedActive:
             alarmStates[alarm.tagName] = .acknowledgedActive
-            // Stays in activeAlarms — condition still present
 
         case .normal:
             alarmStates[alarm.tagName] = .normal
-            activeAlarms.remove(at: idx)    // fully resolved
+            activeAlarms.remove(at: idx)
 
         default: break
         }
@@ -117,15 +145,14 @@ class AlarmManager: ObservableObject {
         Logger.shared.info("Ack \(alarm.tagName) by \(username) → \(updated.state.rawValue)")
     }
 
-    /// Acknowledge ALL visible alarms.
     func acknowledgeAllAlarms(by username: String = "Operator") {
         for i in activeAlarms.indices {
             guard activeAlarms[i].state.requiresAction else { continue }
             activeAlarms[i].acknowledge(by: username)
             syncHistory(activeAlarms[i])
+            persistAlarmUpdate(activeAlarms[i])
             alarmStates[activeAlarms[i].tagName] = activeAlarms[i].state
         }
-        // Remove any that reached .normal (were UnackRTN → Normal)
         activeAlarms.removeAll { $0.state == .normal }
         recalcUnackCount()
         Logger.shared.info("All alarms acknowledged by \(username)")
@@ -174,10 +201,10 @@ class AlarmManager: ObservableObject {
         alarmStates[tagName] = .unacknowledgedActive
         recalcUnackCount()
         triggerAlarmNotification(alarm)
+        persistAlarmInsert(alarm)
         Logger.shared.warning("ALARM: \(message)")
     }
 
-    /// Transition the alarm for tagName from conditionActive → RTN state.
     private func transitionToRTN(tagName: String) {
         guard let idx = activeAlarms.firstIndex(where: {
             $0.tagName == tagName && $0.state.conditionActive
@@ -186,15 +213,15 @@ class AlarmManager: ObservableObject {
         activeAlarms[idx].returnToNormal()
         let updated = activeAlarms[idx]
         syncHistory(updated)
+        persistAlarmUpdate(updated)
 
         switch updated.state {
         case .unacknowledgedRTN:
             alarmStates[tagName] = .unacknowledgedRTN
-            // Stays visible — operator must still ack
 
         case .normal:
             alarmStates[tagName] = .normal
-            activeAlarms.remove(at: idx)    // AckActive→Normal: fully resolved
+            activeAlarms.remove(at: idx)
             recalcUnackCount()
 
         default: break
@@ -203,7 +230,6 @@ class AlarmManager: ObservableObject {
         Logger.shared.info("RTN: \(tagName) → \(updated.state.rawValue)")
     }
 
-    /// Remove a specific alarm from activeAlarms (superseded / re-alarmed).
     private func removeFromActive(tagName: String, state: AlarmState, toHistory: Bool) {
         guard let idx = activeAlarms.firstIndex(where: {
             $0.tagName == tagName && $0.state == state
@@ -213,16 +239,31 @@ class AlarmManager: ObservableObject {
         recalcUnackCount()
     }
 
-    /// Sync an alarm's current state back into alarmHistory.
     private func syncHistory(_ alarm: Alarm) {
         if let hIdx = alarmHistory.firstIndex(where: { $0.id == alarm.id }) {
             alarmHistory[hIdx] = alarm
         }
     }
 
-    /// Recompute unacknowledgedCount from activeAlarms.
     private func recalcUnackCount() {
         unacknowledgedCount = activeAlarms.filter { $0.state.requiresAction }.count
+    }
+
+    // MARK: - DB persistence helpers (fire-and-forget)
+
+    private func persistConfig(_ config: AlarmConfig) {
+        guard let h = historian else { return }
+        Task { try? await h.saveAlarmConfig(config) }
+    }
+
+    private func persistAlarmInsert(_ alarm: Alarm) {
+        guard let h = historian else { return }
+        Task { try? await h.insertAlarmEvent(alarm) }
+    }
+
+    private func persistAlarmUpdate(_ alarm: Alarm) {
+        guard let h = historian else { return }
+        Task { try? await h.updateAlarmEvent(alarm) }
     }
 
     // MARK: - Notifications

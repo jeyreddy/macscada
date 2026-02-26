@@ -17,11 +17,11 @@ class TagEngine: ObservableObject {
     // MARK: - Private Properties
 
     private var subscriptions = Set<AnyCancellable>()
-    private let historian: Historian?
+    let historian: Historian?          // internal — AlarmManager borrows this reference
     private var simulationTimer: Timer?
-    
+
     // MARK: - Initialization
-    
+
     init() {
         // Initialize historian for data logging
         do {
@@ -31,31 +31,51 @@ class TagEngine: ObservableObject {
             Logger.shared.error("Failed to initialize historian: \(error)")
             self.historian = nil
         }
-        
-        // Load sample tags for development
-        loadSampleTags()
+
+        // Restore persisted tag configurations from SQLite
+        if let h = self.historian {
+            Task { [weak self] in
+                guard let self else { return }
+                await self.loadPersistedTags(historian: h)
+            }
+        }
     }
-    
-    private func loadSampleTags() {
-        // Tags are populated dynamically from the OPC-UA Browser.
-        // Double-click any variable node in the Browser to add it here.
-        Logger.shared.info("Tag engine ready — add tags from the OPC-UA Browser")
+
+    private func loadPersistedTags(historian: Historian) async {
+        do {
+            let savedTags = try await historian.loadTagConfigs()
+            for tag in savedTags {
+                if tags[tag.name] == nil {   // don't overwrite live values
+                    tags[tag.name] = tag
+                }
+            }
+            tagCount = tags.count
+            Logger.shared.info("Restored \(savedTags.count) tag configs from database")
+        } catch {
+            Logger.shared.error("Failed to load tag configs: \(error)")
+        }
     }
     
     // MARK: - Tag Management
     
-    /// Add a new tag to the engine
+    /// Add a new tag to the engine and persist its config.
     func addTag(_ tag: Tag) {
         tags[tag.name] = tag
         tagCount = tags.count
         Logger.shared.debug("Added tag: \(tag.name)")
+        if let h = historian {
+            Task { try? await h.saveTagConfig(tag) }
+        }
     }
-    
-    /// Remove a tag from the engine
+
+    /// Remove a tag from the engine and delete its persisted config.
     func removeTag(named name: String) {
         tags.removeValue(forKey: name)
         tagCount = tags.count
         Logger.shared.debug("Removed tag: \(name)")
+        if let h = historian {
+            Task { try? await h.deleteTagConfig(name: name) }
+        }
     }
     
     /// Update tag value
@@ -73,13 +93,7 @@ class TagEngine: ObservableObject {
             
             // Log to historian if enabled
             if let historian = historian, quality == .good {
-                Task {
-                    try? await historian.logValue(
-                        tagName: name,
-                        value: value,
-                        timestamp: timestamp
-                    )
-                }
+                Task { try? await historian.logValue(tagName: name, value: value, timestamp: timestamp) }
             }
 
             // Notify observers (e.g. AlarmManager in simulation mode)
@@ -224,8 +238,7 @@ class TagEngine: ObservableObject {
         guard let historian else { return [:] }
         var result: [String: [HistoricalDataPoint]] = [:]
         for name in tagNames {
-            let points = try? await historian.getHistory(
-                for: name, from: startTime, to: endTime, maxPoints: maxPoints)
+            let points = try? await historian.getHistory(for: name, from: startTime, to: endTime, maxPoints: maxPoints)
             result[name] = points ?? []
         }
         return result

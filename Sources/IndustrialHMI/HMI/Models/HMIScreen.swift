@@ -10,4 +10,8 @@ struct HMIScreen: Codable, Equatable {
     var backgroundColor: CodableColor = .darkBackground
     var objects: [HMIObject]      = []
     var modifiedAt: Date          = Date()
+
+    init(name: String = "Screen 1") {
+        self.name = name
+    }
 }
