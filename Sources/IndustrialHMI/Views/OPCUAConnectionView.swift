@@ -8,7 +8,8 @@ struct OPCUAConnectionView: View {
     @EnvironmentObject var dataService:  DataService
 
     // Bonjour scanner (mDNS — finds servers without knowing their hostname)
-    @StateObject private var bonjour = OPCUABonjourScanner()
+    @StateObject private var bonjour    = OPCUABonjourScanner()
+    @StateObject private var diagnostics = OPCUADiagnostics()
 
     // Endpoint discovery (UA_Client_getEndpoints at a known URL)
     @State private var discoveryURL       = ""
@@ -22,6 +23,10 @@ struct OPCUAConnectionView: View {
     @State private var isConnecting   = false
     @State private var connectError:  String?
 
+    // Diagnostics panel
+    @State private var showDiagnostics = false
+    @State private var diagURL         = ""
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -31,12 +36,17 @@ struct OPCUAConnectionView: View {
 
                 Divider()
 
-                // ── 2. mDNS / Bonjour scan ───────────────────────────────────
+                // ── 2. Diagnostics ───────────────────────────────────────────
+                diagnosticsSection
+
+                Divider()
+
+                // ── 3. mDNS / Bonjour scan ───────────────────────────────────
                 bonjourSection
 
                 Divider()
 
-                // ── 3. Endpoint discovery (by URL) ───────────────────────────
+                // ── 4. Endpoint discovery (by URL) ───────────────────────────
                 discoverySection
 
                 if !discoveredEndpoints.isEmpty { endpointResultsSection }
@@ -44,7 +54,7 @@ struct OPCUAConnectionView: View {
 
                 Divider()
 
-                // ── 4. Quick connect ─────────────────────────────────────────
+                // ── 5. Quick connect ─────────────────────────────────────────
                 quickConnectSection
             }
             .padding(20)
@@ -52,10 +62,141 @@ struct OPCUAConnectionView: View {
         .navigationTitle("OPC-UA Connection")
         .onAppear {
             let saved = Configuration.opcuaServerURL
-            if !saved.isEmpty {
-                directURL    = saved
-                discoveryURL = saved
+            let defaultURL = saved.isEmpty ? "opc.tcp://localhost:4840" : saved
+            directURL    = defaultURL
+            discoveryURL = defaultURL
+            diagURL      = defaultURL
+        }
+    }
+
+    // MARK: - Diagnostics Section
+
+    private var diagnosticsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Connection Diagnostics", systemImage: "stethoscope")
+                .font(.headline)
+
+            Text("Step-by-step check: URL parsing → hostname resolution → TCP port test → OPC-UA endpoint probe.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            HStack(spacing: 8) {
+                TextField("opc.tcp://host:4840", text: $diagURL)
+                    .textFieldStyle(.roundedBorder)
+
+                Button {
+                    showDiagnostics = true
+                    Task { await diagnostics.run(url: diagURL) }
+                } label: {
+                    if diagnostics.isRunning {
+                        Label("Running…", systemImage: "waveform.path.ecg")
+                    } else {
+                        Label("Diagnose", systemImage: "stethoscope")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.indigo)
+                .disabled(diagURL.trimmingCharacters(in: .whitespaces).isEmpty || diagnostics.isRunning)
             }
+
+            // Quick presets
+            HStack(spacing: 6) {
+                Text("Quick:").font(.caption2).foregroundColor(.secondary)
+                ForEach(["localhost", "127.0.0.1", ProcessInfo.processInfo.hostName], id: \.self) { h in
+                    Button(h) {
+                        let url = "opc.tcp://\(h):4840"
+                        diagURL      = url
+                        directURL    = url
+                        discoveryURL = url
+                        showDiagnostics = true
+                        Task { await diagnostics.run(url: url) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                }
+            }
+
+            if showDiagnostics && !diagnostics.steps.isEmpty {
+                diagnosticsResults
+            }
+        }
+    }
+
+    private var diagnosticsResults: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(diagnostics.steps) { step in
+                HStack(alignment: .top, spacing: 8) {
+                    stepIcon(step.status)
+                        .frame(width: 18)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(step.title).font(.caption.bold())
+                        Text(step.detail)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if let sug = step.suggestion {
+                            Text(sug)
+                                .font(.caption)
+                                .foregroundColor(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    Spacer()
+                    if let ms = step.durationMs {
+                        Text("\(ms) ms").font(.caption2).foregroundColor(.secondary)
+                    }
+                }
+                .padding(8)
+                .background(stepBackground(step.status))
+                .cornerRadius(6)
+            }
+
+            if !diagnostics.suggestedURLs.isEmpty {
+                Divider()
+                Text("Suggested URLs to try:")
+                    .font(.caption.bold())
+                    .foregroundColor(.green)
+                ForEach(diagnostics.suggestedURLs, id: \.self) { url in
+                    HStack(spacing: 8) {
+                        Text(url)
+                            .font(.caption)
+                            .textSelection(.enabled)
+                        Spacer()
+                        Button("Connect") { connectTo(url: url) }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.mini)
+                            .tint(.green)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.green.opacity(0.06))
+                    .cornerRadius(6)
+                }
+            }
+        }
+        .padding(10)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .cornerRadius(8)
+        .overlay(RoundedRectangle(cornerRadius: 8)
+            .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5))
+    }
+
+    @ViewBuilder
+    private func stepIcon(_ status: DiagnosticStep.Status) -> some View {
+        switch status {
+        case .pass:    Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+        case .fail:    Image(systemName: "xmark.circle.fill").foregroundColor(.red)
+        case .warning: Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
+        case .running: ProgressView().controlSize(.mini)
+        }
+    }
+
+    private func stepBackground(_ status: DiagnosticStep.Status) -> Color {
+        switch status {
+        case .pass:    return Color.green.opacity(0.05)
+        case .fail:    return Color.red.opacity(0.05)
+        case .warning: return Color.orange.opacity(0.05)
+        case .running: return Color(nsColor: .controlBackgroundColor)
         }
     }
 
