@@ -1,10 +1,12 @@
 import Foundation
+import Darwin
 import COPC
 
 @MainActor
 class OPCUAClientService: ObservableObject {
     @Published var connectionState: ConnectionState = .disconnected
     @Published var isPolling: Bool = false
+    @Published var serverURL: String = Configuration.opcuaServerURL
 
     // Accessed only on @MainActor for the nil-guard; the captured OpaquePointer
     // *value* is then passed into opcuaQueue blocks by value — never re-read from
@@ -17,6 +19,8 @@ class OPCUAClientService: ObservableObject {
 
     // Single serial queue — every C library call goes here, nothing else.
     private let opcuaQueue = DispatchQueue(label: "com.industrialhmi.opcua", qos: .userInitiated)
+    // Separate queue for discovery so it never delays polling.
+    private let discoveryQueue = DispatchQueue(label: "com.industrialhmi.discovery", qos: .userInitiated)
 
     private var tagCallbacks: [String: [(String, TagValue, TagQuality, Date) -> Void]] = [:]
     private var reconnectTask: Task<Void, Never>?
@@ -45,7 +49,18 @@ class OPCUAClientService: ObservableObject {
 
     // MARK: - Connection Management
 
+    /// Connect to a specific URL — saves it for future reconnects.
+    func connect(to url: String) async throws {
+        serverURL = url
+        Configuration.opcuaServerURL = url
+        try await connect()
+    }
+
     func connect() async throws {
+        let url = serverURL
+        guard !url.isEmpty else {
+            throw OPCUAError.connectionFailed("No server URL configured. Set one in Settings.")
+        }
         // Bail out if already connected OR if a connect is already in flight (.connecting).
         guard connectionState == .disconnected || connectionState == .error else { return }
         connectionState = .connecting
@@ -57,7 +72,7 @@ class OPCUAClientService: ObservableObject {
                 let config    = UA_Client_getConfig(newClient)
                 UA_ClientConfig_setDefault(config)
 
-                let retval = UA_Client_connect(newClient, Configuration.opcuaServerURL)
+                let retval = UA_Client_connect(newClient, url)
 
                 if retval == UA_STATUSCODE_GOOD {
                     DispatchQueue.main.async {
@@ -276,6 +291,13 @@ class OPCUAClientService: ObservableObject {
         }
     }
 
+    /// Safely convert a UA_String (length + non-null-terminated data) to Swift String.
+    private nonisolated func uaStr(_ s: UA_String) -> String {
+        guard s.length > 0, let data = s.data else { return "" }
+        return String(bytes: UnsafeRawBufferPointer(start: data, count: s.length),
+                      encoding: .utf8) ?? ""
+    }
+
     private nonisolated func convertVariantToTagValue(_ variant: UnsafeMutablePointer<UA_Variant>) -> TagValue {
         guard let typePtr = variant.pointee.type else {
             return .none
@@ -301,6 +323,111 @@ class OPCUAClientService: ObservableObject {
         }
 
         return .none
+    }
+
+    // MARK: - Discovery
+
+    /// Query a URL for all available endpoints (security modes, server type, etc.).
+    /// Uses a temporary client on discoveryQueue — never blocks polling.
+    func getEndpoints(at url: String) async -> [OPCUAEndpointInfo] {
+        await withCheckedContinuation { continuation in
+            self.discoveryQueue.async {
+                let tmp = UA_Client_new()
+                UA_ClientConfig_setDefault(UA_Client_getConfig(tmp))
+                defer { UA_Client_delete(tmp) }
+
+                var count: Int = 0
+                var eps: UnsafeMutablePointer<UA_EndpointDescription>? = nil
+
+                let status = UA_Client_getEndpoints(tmp, url, &count, &eps)
+                guard status == UA_STATUSCODE_GOOD, count > 0, let ep = eps else {
+                    Logger.shared.warning("getEndpoints failed at \(url): \(status)")
+                    continuation.resume(returning: [])
+                    return
+                }
+
+                var infos: [OPCUAEndpointInfo] = []
+                for i in 0..<count {
+                    let desc  = ep[i]
+                    let epUrl = self.uaStr(desc.endpointUrl)
+                    let srvName = self.uaStr(desc.server.applicationName.text)
+                    let appType = OPCUAApplicationType(rawValue: desc.server.applicationType.rawValue)
+                    let secMode = OPCUASecurityMode(rawMode: desc.securityMode.rawValue)
+                    let policy  = self.uaStr(desc.securityPolicyUri)
+                    infos.append(OPCUAEndpointInfo(
+                        endpointUrl:    epUrl.isEmpty ? url : epUrl,
+                        serverName:     srvName.isEmpty ? "OPC-UA Server" : srvName,
+                        applicationType: appType,
+                        securityMode:   secMode,
+                        securityPolicy: policy
+                    ))
+                }
+
+                // Cleanup — clear each element then free the C array
+                for i in 0..<count {
+                    var ep = eps!.advanced(by: i).pointee
+                    UA_EndpointDescription_clear(&ep)
+                }
+                Darwin.free(eps)
+
+                continuation.resume(returning: infos)
+            }
+        }
+    }
+
+    /// Query a URL for registered application descriptions.
+    func findServers(at url: String) async -> [OPCUAServerInfo] {
+        await withCheckedContinuation { continuation in
+            self.discoveryQueue.async {
+                let tmp = UA_Client_new()
+                UA_ClientConfig_setDefault(UA_Client_getConfig(tmp))
+                defer { UA_Client_delete(tmp) }
+
+                var count: Int = 0
+                var apps: UnsafeMutablePointer<UA_ApplicationDescription>? = nil
+
+                let status = UA_Client_findServers(tmp, url, 0, nil, 0, nil, &count, &apps)
+                guard status == UA_STATUSCODE_GOOD, count > 0, let ap = apps else {
+                    Logger.shared.warning("findServers failed at \(url): \(status)")
+                    continuation.resume(returning: [])
+                    return
+                }
+
+                var infos: [OPCUAServerInfo] = []
+                for i in 0..<count {
+                    let desc = ap[i]
+                    let name = self.uaStr(desc.applicationName.text)
+                    let uri  = self.uaStr(desc.applicationUri)
+                    let type = OPCUAApplicationType(rawValue: desc.applicationType.rawValue)
+                    var urls: [String] = []
+                    for j in 0..<Int(desc.discoveryUrlsSize) {
+                        let u = self.uaStr(desc.discoveryUrls[j])
+                        if !u.isEmpty { urls.append(u) }
+                    }
+                    infos.append(OPCUAServerInfo(
+                        applicationName: name.isEmpty ? "OPC-UA Server" : name,
+                        applicationUri:  uri,
+                        applicationType: type,
+                        discoveryUrls:   urls
+                    ))
+                }
+
+                for i in 0..<count {
+                    var app = apps!.advanced(by: i).pointee
+                    UA_ApplicationDescription_clear(&app)
+                }
+                Darwin.free(apps)
+
+                continuation.resume(returning: infos)
+            }
+        }
+    }
+
+    /// Convenience: run getEndpoints + findServers together.
+    func discoverAt(url: String) async -> (endpoints: [OPCUAEndpointInfo], servers: [OPCUAServerInfo]) {
+        async let eps = getEndpoints(at: url)
+        async let srvs = findServers(at: url)
+        return await (eps, srvs)
     }
 
     // MARK: - Browse Operations

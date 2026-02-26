@@ -55,17 +55,17 @@ class DataService: ObservableObject {
         if Configuration.simulationMode {
             Logger.shared.info("Starting simulation mode")
             tagEngine.startSimulation()
-        } else {
+        } else if !Configuration.opcuaServerURL.isEmpty {
             do {
                 try await opcuaService.connect()
                 Logger.shared.info("OPC-UA connection ready")
                 opcuaService.startAutoReconnect()
             } catch {
-                isRunning = false
-                Logger.shared.error("Connection failed: \(error)")
-                // Even on initial failure, start reconnect loop
-                opcuaService.startAutoReconnect()
+                Logger.shared.error("Initial connection failed: \(error.localizedDescription)")
+                opcuaService.startAutoReconnect()   // keep retrying in background
             }
+        } else {
+            Logger.shared.info("No OPC-UA server configured — go to Settings to connect")
         }
     }
 

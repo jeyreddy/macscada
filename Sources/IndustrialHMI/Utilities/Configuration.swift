@@ -4,8 +4,11 @@ import Foundation
 struct Configuration {
     // MARK: - OPC-UA Settings
     
-    /// OPC-UA server endpoint URL
-    static let opcuaServerURL = "opc.tcp://mac:4840"
+    /// OPC-UA server endpoint URL (persisted in UserDefaults; empty = not yet configured)
+    static var opcuaServerURL: String {
+        get { UserDefaults.standard.string(forKey: "opcua.serverURL") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "opcua.serverURL") }
+    }
     
     /// Connection timeout in seconds
     static let connectionTimeout: TimeInterval = 30.0

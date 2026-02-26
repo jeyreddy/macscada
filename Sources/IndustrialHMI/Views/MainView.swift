@@ -112,16 +112,13 @@ enum Tab: String, CaseIterable, Identifiable {
     }
 }
 
-// MARK: - Settings View
+// MARK: - Settings View (delegates to OPCUAConnectionView)
 
 struct SettingsView: View {
+    @EnvironmentObject var opcuaService: OPCUAClientService
+    @EnvironmentObject var dataService:  DataService
+
     var body: some View {
-        Form {
-            Section("OPC-UA Connection") {
-                Text("Server: \(Configuration.opcuaServerURL)")
-            }
-        }
-        .formStyle(.grouped)
-        .navigationTitle("Settings")
+        OPCUAConnectionView()
     }
 }
