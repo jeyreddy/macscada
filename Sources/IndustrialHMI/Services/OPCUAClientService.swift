@@ -49,8 +49,9 @@ class OPCUAClientService: ObservableObject {
 
     // MARK: - Connection Management
 
-    /// Connect to a specific URL — saves it for future reconnects.
+    /// Connect to a specific URL — stops any pending reconnect loop, saves URL, connects.
     func connect(to url: String) async throws {
+        stopAutoReconnect()              // cancel reconnect loop before manual attempt
         serverURL = url
         Configuration.opcuaServerURL = url
         try await connect()
@@ -82,13 +83,12 @@ class OPCUAClientService: ObservableObject {
                         continuation.resume()
                     }
                 } else {
-                    // Delete happens here, on opcuaQueue — correct.
                     UA_Client_delete(newClient)
+                    let desc = self?.statusCodeMessage(retval) ?? "Status 0x\(String(retval, radix: 16, uppercase: true))"
                     DispatchQueue.main.async {
                         self?.connectionState = .error
                     }
-                    continuation.resume(throwing: OPCUAError.connectionFailed(
-                        "Connection failed with status code \(retval)"))
+                    continuation.resume(throwing: OPCUAError.connectionFailed(desc))
                 }
             }
         }
@@ -288,6 +288,29 @@ class OPCUAClientService: ObservableObject {
                         "Read failed with status \(retval)"))
                 }
             }
+        }
+    }
+
+    /// Human-readable description for common UA_StatusCode values.
+    private nonisolated func statusCodeMessage(_ code: UA_StatusCode) -> String {
+        let hex = "0x\(String(format: "%08X", code))"
+        switch code {
+        case 0x80AE0000:
+            return "Server closed the connection (\(hex)) — hostname may be wrong or server is down. Use 'Scan Network' to rediscover."
+        case 0x80AC0000:
+            return "Connection rejected (\(hex)) — server is running but refused the connection."
+        case 0x800A0000:
+            return "Connection timed out (\(hex)) — check the IP/hostname and port (default: 4840)."
+        case 0x808A0000:
+            return "Not connected (\(hex))."
+        case 0x80120000:
+            return "Certificate invalid (\(hex)) — server requires a trusted certificate."
+        case 0x80160000:
+            return "Certificate hostname invalid (\(hex))."
+        case 0x801F0000:
+            return "Access denied (\(hex)) — check username/password."
+        default:
+            return "OPC-UA error \(hex) — verify the server URL and that the server is running."
         }
     }
 

@@ -2,60 +2,59 @@ import SwiftUI
 
 // MARK: - OPCUAConnectionView
 
-/// Full OPC-UA server discovery and connection management panel.
-/// Shown in the Settings tab.
+/// Full OPC-UA server discovery and connection management panel (Settings tab).
 struct OPCUAConnectionView: View {
     @EnvironmentObject var opcuaService: OPCUAClientService
     @EnvironmentObject var dataService:  DataService
 
-    // Discovery
-    @State private var discoveryURL:  String = Configuration.opcuaServerURL.isEmpty
-                                               ? "opc.tcp://localhost:4840"
-                                               : Configuration.opcuaServerURL
-    @State private var isDiscovering: Bool   = false
-    @State private var discoveredEndpoints:  [OPCUAEndpointInfo]  = []
-    @State private var discoveredServers:    [OPCUAServerInfo]     = []
-    @State private var discoveryError:       String?
+    // Bonjour scanner (mDNS — finds servers without knowing their hostname)
+    @StateObject private var bonjour = OPCUABonjourScanner()
+
+    // Endpoint discovery (UA_Client_getEndpoints at a known URL)
+    @State private var discoveryURL       = ""
+    @State private var isDiscovering      = false
+    @State private var discoveredEndpoints: [OPCUAEndpointInfo] = []
+    @State private var discoveredServers:   [OPCUAServerInfo]   = []
+    @State private var discoveryError:    String?
 
     // Direct connect
-    @State private var directURL:  String = Configuration.opcuaServerURL
-    @State private var isConnecting: Bool = false
+    @State private var directURL      = ""
+    @State private var isConnecting   = false
     @State private var connectError:  String?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
 
-                // ── Status card ─────────────────────────────────────────────
+                // ── 1. Live status card ──────────────────────────────────────
                 statusCard
 
                 Divider()
 
-                // ── Discovery section ────────────────────────────────────────
-                discoverySection
-
-                // ── Results ──────────────────────────────────────────────────
-                if !discoveredEndpoints.isEmpty {
-                    endpointResultsSection
-                }
-
-                if !discoveredServers.isEmpty && discoveredEndpoints.isEmpty {
-                    serverResultsSection
-                }
+                // ── 2. mDNS / Bonjour scan ───────────────────────────────────
+                bonjourSection
 
                 Divider()
 
-                // ── Quick connect ────────────────────────────────────────────
+                // ── 3. Endpoint discovery (by URL) ───────────────────────────
+                discoverySection
+
+                if !discoveredEndpoints.isEmpty { endpointResultsSection }
+                if discoveredEndpoints.isEmpty && !discoveredServers.isEmpty { serverResultsSection }
+
+                Divider()
+
+                // ── 4. Quick connect ─────────────────────────────────────────
                 quickConnectSection
             }
             .padding(20)
         }
         .navigationTitle("OPC-UA Connection")
         .onAppear {
-            // Sync text fields with current saved URL
-            if !Configuration.opcuaServerURL.isEmpty {
-                directURL    = Configuration.opcuaServerURL
-                discoveryURL = Configuration.opcuaServerURL
+            let saved = Configuration.opcuaServerURL
+            if !saved.isEmpty {
+                directURL    = saved
+                discoveryURL = saved
             }
         }
     }
@@ -102,18 +101,115 @@ struct OPCUAConnectionView: View {
         case .connected:    return .green
         case .connecting:   return .orange
         case .error:        return .red
-        case .disconnected: return .secondary
+        case .disconnected: return Color.secondary
         }
     }
 
-    // MARK: - Discovery Section
+    // MARK: - Bonjour Section
+
+    private var bonjourSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Scan Local Network (mDNS)", systemImage: "wifi.router")
+                .font(.headline)
+
+            Text("Automatically find OPC-UA servers on your local network — no hostname needed. Most industrial servers (Kepware, Prosys, open62541, UA Demo Server …) advertise via Bonjour.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            HStack(spacing: 8) {
+                Button {
+                    if bonjour.isScanning { bonjour.stopScan() }
+                    else                  { bonjour.scan() }
+                } label: {
+                    if bonjour.isScanning {
+                        Label("Scanning…", systemImage: "stop.circle")
+                    } else {
+                        Label("Scan Network", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+
+                if bonjour.isScanning {
+                    ProgressView().controlSize(.small)
+                    Text("Listening for 6 s…")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            if bonjour.servers.isEmpty && !bonjour.isScanning
+                && !directURL.isEmpty {
+                // Subtle hint after a scan found nothing
+            } else if !bonjour.servers.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Found \(bonjour.servers.count) server\(bonjour.servers.count == 1 ? "" : "s") via mDNS")
+                        .font(.subheadline.bold())
+                    ForEach(bonjour.servers) { srv in
+                        bonjourRow(srv)
+                    }
+                }
+            } else if !bonjour.isScanning && bonjour.servers.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "info.circle")
+                        .foregroundColor(.secondary)
+                        .font(.caption)
+                    Text("No OPC-UA servers found via mDNS. Try entering the server IP/hostname manually below.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+
+    private func bonjourRow(_ srv: OPCUABonjourServer) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "server.rack")
+                .font(.title3)
+                .foregroundColor(.accentColor)
+                .frame(width: 28)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(srv.name.isEmpty ? srv.host : srv.name)
+                    .font(.body.bold())
+                    .lineLimit(1)
+                Text(srv.url)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+            }
+
+            Spacer()
+
+            Button("Probe") {
+                discoveryURL = srv.url
+                runDiscovery()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Query endpoints at this server")
+
+            Button("Connect") {
+                connectTo(url: srv.url)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .disabled(isConnecting || opcuaService.connectionState == .connecting)
+        }
+        .padding(10)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .cornerRadius(8)
+        .overlay(RoundedRectangle(cornerRadius: 8)
+            .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5))
+    }
+
+    // MARK: - Endpoint Discovery Section
 
     private var discoverySection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label("Server Discovery", systemImage: "network.badge.shield.half.filled")
+            Label("Probe Server Endpoints", systemImage: "list.bullet.rectangle")
                 .font(.headline)
 
-            Text("Enter a server or discovery-server URL to browse available endpoints and server types.")
+            Text("Enter a URL to query the server's available endpoints and security modes.")
                 .font(.caption)
                 .foregroundColor(.secondary)
 
@@ -128,22 +224,23 @@ struct OPCUAConnectionView: View {
                     if isDiscovering {
                         ProgressView().controlSize(.small)
                     } else {
-                        Label("Discover", systemImage: "magnifyingglass")
+                        Label("Probe", systemImage: "magnifyingglass")
                     }
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(discoveryURL.trimmingCharacters(in: .whitespaces).isEmpty || isDiscovering)
-                .frame(minWidth: 90)
+                .frame(minWidth: 80)
             }
 
             if let err = discoveryError {
-                HStack(spacing: 6) {
+                HStack(alignment: .top, spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundColor(.orange)
                         .font(.caption)
                     Text(err)
                         .font(.caption)
                         .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
@@ -154,7 +251,7 @@ struct OPCUAConnectionView: View {
     private var endpointResultsSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Found \(discoveredEndpoints.count) endpoint\(discoveredEndpoints.count == 1 ? "" : "s")")
+                Text("Endpoints (\(discoveredEndpoints.count))")
                     .font(.subheadline.bold())
                 Spacer()
                 Button("Clear") {
@@ -166,7 +263,6 @@ struct OPCUAConnectionView: View {
                 .foregroundColor(.secondary)
                 .font(.caption)
             }
-
             ForEach(discoveredEndpoints) { ep in
                 endpointRow(ep)
             }
@@ -175,27 +271,23 @@ struct OPCUAConnectionView: View {
 
     private func endpointRow(_ ep: OPCUAEndpointInfo) -> some View {
         HStack(spacing: 12) {
-            // Server type icon
             Image(systemName: ep.applicationType.systemIcon)
                 .font(.title3)
                 .foregroundColor(.accentColor)
                 .frame(width: 28)
 
             VStack(alignment: .leading, spacing: 3) {
-                // Server name + type badge
                 HStack(spacing: 6) {
                     Text(ep.serverName)
                         .font(.body.bold())
                         .lineLimit(1)
                     typeBadge(ep.applicationType)
                 }
-                // Endpoint URL
                 Text(ep.endpointUrl)
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .textSelection(.enabled)
                     .lineLimit(1)
-                // Security badge
                 HStack(spacing: 4) {
                     Image(systemName: securityIcon(ep.securityMode))
                         .font(.caption2)
@@ -213,13 +305,12 @@ struct OPCUAConnectionView: View {
 
             Spacer()
 
-            // Connect to this endpoint
             Button("Connect") {
                 connectTo(url: ep.endpointUrl)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(isConnecting || opcuaService.connectionState == .connecting)
             .controlSize(.small)
+            .disabled(isConnecting || opcuaService.connectionState == .connecting)
         }
         .padding(10)
         .background(Color(nsColor: .controlBackgroundColor))
@@ -228,27 +319,25 @@ struct OPCUAConnectionView: View {
             .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5))
     }
 
-    // MARK: - Server (ApplicationDescription) Results
+    // MARK: - Server Results (from findServers — no endpoints returned yet)
 
     private var serverResultsSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Registered Servers (\(discoveredServers.count))")
                 .font(.subheadline.bold())
-
             ForEach(discoveredServers) { srv in
                 HStack(spacing: 12) {
                     Image(systemName: srv.applicationType.systemIcon)
                         .font(.title3)
                         .foregroundColor(.accentColor)
                         .frame(width: 28)
-
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 6) {
                             Text(srv.applicationName).font(.body.bold()).lineLimit(1)
                             typeBadge(srv.applicationType)
                         }
                         ForEach(srv.discoveryUrls, id: \.self) { url in
-                            Text(url).font(.caption).foregroundColor(.secondary).lineLimit(1)
+                            Text(url).font(.caption).foregroundColor(.secondary)
                         }
                     }
                     Spacer()
@@ -275,12 +364,12 @@ struct OPCUAConnectionView: View {
             Label("Direct Connection", systemImage: "link")
                 .font(.headline)
 
-            Text("Type a server URL directly and connect without scanning.")
+            Text("Type a URL and connect directly. The address is saved for auto-reconnect across restarts.")
                 .font(.caption)
                 .foregroundColor(.secondary)
 
             HStack(spacing: 8) {
-                TextField("opc.tcp://host:4840", text: $directURL)
+                TextField("opc.tcp://192.168.1.100:4840", text: $directURL)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { connectTo(url: directURL) }
 
@@ -301,25 +390,29 @@ struct OPCUAConnectionView: View {
             }
 
             if let err = connectError {
-                HStack(spacing: 6) {
+                HStack(alignment: .top, spacing: 6) {
                     Image(systemName: "xmark.octagon.fill")
                         .foregroundColor(.red)
                         .font(.caption)
                     Text(err)
                         .font(.caption)
                         .foregroundColor(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
                 }
+                .padding(8)
+                .background(Color.red.opacity(0.06))
+                .cornerRadius(6)
             }
         }
     }
 
-    // MARK: - Badge helpers
+    // MARK: - Badge / Icon helpers
 
     private func typeBadge(_ type: OPCUAApplicationType) -> some View {
         Text(type.rawValue)
             .font(.caption2.bold())
-            .padding(.horizontal, 5)
-            .padding(.vertical, 2)
+            .padding(.horizontal, 5).padding(.vertical, 2)
             .background(badgeColor(type).opacity(0.15))
             .foregroundColor(badgeColor(type))
             .cornerRadius(4)
@@ -357,18 +450,17 @@ struct OPCUAConnectionView: View {
     private func runDiscovery() {
         let url = discoveryURL.trimmingCharacters(in: .whitespaces)
         guard !url.isEmpty else { return }
-        isDiscovering = true
-        discoveryError = nil
+        isDiscovering   = true
+        discoveryError  = nil
         discoveredEndpoints = []
         discoveredServers   = []
-
         Task {
             let (eps, srvs) = await opcuaService.discoverAt(url: url)
             isDiscovering = false
             discoveredEndpoints = eps
             discoveredServers   = srvs
             if eps.isEmpty && srvs.isEmpty {
-                discoveryError = "No endpoints or servers found at \(url). Check the URL and ensure the server is running."
+                discoveryError = "No endpoints found at \(url). The server may be down or this URL may not support discovery. Try 'Scan Network' to find the server automatically."
             }
         }
     }
@@ -378,14 +470,11 @@ struct OPCUAConnectionView: View {
         guard !trimmed.isEmpty else { return }
         isConnecting = true
         connectError = nil
-
         Task {
             do {
                 try await opcuaService.connect(to: trimmed)
-                // After successful connect, kick off polling and reconnect loop
                 if opcuaService.connectionState == .connected {
                     opcuaService.startAutoReconnect()
-                    try? await opcuaService.subscribe(to: [], callback: { _, _, _, _ in })
                 }
             } catch {
                 connectError = error.localizedDescription
