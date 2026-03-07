@@ -1,6 +1,56 @@
+// MARK: - OPCUAClientService.swift
+//
+// Wraps the open62541 C OPC-UA client library (COPC Swift package) in an
+// @MainActor-observable service. All OPC-UA C API calls are dispatched onto
+// a dedicated serial `opcuaQueue` so the UI thread never blocks on I/O.
+//
+// ── Thread Safety Model ───────────────────────────────────────────────────────
+//   OPCUAHandle wraps OpaquePointer as @unchecked Sendable so it can be
+//   captured by value in opcuaQueue async blocks. The @MainActor class never
+//   dereferences the pointer — only the queue blocks do. This makes the
+//   pattern safe: one actor manages metadata; one queue owns the C pointer.
+//
+// ── Connection Lifecycle ──────────────────────────────────────────────────────
+//   connect(to:) → stops any pending reconnect → saves URL → connect()
+//   connect() → guard disconnected/error → set .connecting → opcuaQueue:
+//     UA_Client_new() → UA_ClientConfig_setDefault() → UA_Client_connect()
+//     → success: set .connected, start polling timer
+//     → failure: set .error, start auto-reconnect loop
+//   disconnect() → pollingTimer.invalidate() → opcuaQueue: UA_Client_disconnect()
+//   Auto-reconnect: exponential back-off Task, 5 retries max
+//
+// ── Polling ───────────────────────────────────────────────────────────────────
+//   pollingTimer fires every Configuration.pollingInterval (default 500 ms) on @MainActor.
+//   isPollInFlight flag prevents a slow poll from stacking on top of itself.
+//   Each poll:
+//     For each registered nodeId → UA_Client_readValueAttribute_sync() on opcuaQueue
+//     → decode UA_Variant → TagValue + TagQuality
+//     → call all tagCallbacks[nodeId] (received on @MainActor)
+//
+// ── Tag Subscriptions ─────────────────────────────────────────────────────────
+//   TagEngine registers callbacks via subscribeToTag(nodeId:callback:) and
+//   unsubscribeFromTag(nodeId:). The tagCallbacks dict maps nodeId → [callback].
+//   Multiple tags with the same nodeId share a single read per poll.
+//
+// ── Write ─────────────────────────────────────────────────────────────────────
+//   writeValue(nodeId:value:) → UA_Client_writeValueAttribute_sync() on opcuaQueue.
+//   Returns true/false based on UA_StatusCode_isGood.
+//
+// ── Discovery ─────────────────────────────────────────────────────────────────
+//   browseAddressSpace(root:) does a recursive BrowseRequest from the specified
+//   node on `discoveryQueue` (separate from polling queue so discovery never
+//   delays live tag reads). Returns [OPCUANode] on @MainActor.
+//   findServers(on:) uses UA_Client_findServers() for endpoint discovery.
+//
+// ── Errors ────────────────────────────────────────────────────────────────────
+//   OPCUAError: connectionFailed, readFailed, writeFailed, browseFailed, notConnected
+
 import Foundation
 import Darwin
 import COPC
+
+/// Thread-safety for OPC-UA C client pointers is enforced by `opcuaQueue` (serial DispatchQueue).
+private struct OPCUAHandle: @unchecked Sendable { let ptr: OpaquePointer }
 
 @MainActor
 class OPCUAClientService: ObservableObject {
@@ -40,9 +90,10 @@ class OPCUAClientService: ObservableObject {
         // Capture the raw pointer value; opcuaQueue outlives self (the block
         // retains the queue through GCD's internal reference counting).
         if let c = client {
+            let handle = OPCUAHandle(ptr: c)
             opcuaQueue.async {
-                UA_Client_disconnect(c)
-                UA_Client_delete(c)
+                UA_Client_disconnect(handle.ptr)
+                UA_Client_delete(handle.ptr)
             }
         }
     }
@@ -98,6 +149,12 @@ class OPCUAClientService: ObservableObject {
         pollingTimer?.invalidate()
         pollingTimer = nil
         isPolling = false
+
+        // Notify all subscribed tags that data is no longer current.
+        let now = Date()
+        for (nodeId, callbacks) in tagCallbacks {
+            for cb in callbacks { cb(nodeId, .none, .uncertain, now) }
+        }
         tagCallbacks.removeAll()
 
         guard let clientToDisconnect = client else {
@@ -114,10 +171,11 @@ class OPCUAClientService: ObservableObject {
         client = nil
         connectionState = .disconnected
 
+        let handle = OPCUAHandle(ptr: clientToDisconnect)
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             self.opcuaQueue.async {
-                UA_Client_disconnect(clientToDisconnect)
-                UA_Client_delete(clientToDisconnect)
+                UA_Client_disconnect(handle.ptr)
+                UA_Client_delete(handle.ptr)
                 continuation.resume()
             }
         }
@@ -171,15 +229,19 @@ class OPCUAClientService: ObservableObject {
         }
 
         for nodeId in nodeIds {
-            if tagCallbacks[nodeId] == nil {
-                tagCallbacks[nodeId] = []
-            }
-            tagCallbacks[nodeId]?.append(callback)
+            // Replace (not append) to prevent duplicate callbacks across reconnect cycles.
+            tagCallbacks[nodeId] = [callback]
         }
 
         if pollingTimer == nil {
             startPolling()
         }
+    }
+
+    /// Remove a single nodeId from the poll list (called when a tag is deleted).
+    func unsubscribe(nodeId: String) {
+        tagCallbacks.removeValue(forKey: nodeId)
+        if tagCallbacks.isEmpty { pausePolling() }
     }
 
     func startPolling() {
@@ -207,6 +269,7 @@ class OPCUAClientService: ObservableObject {
         isPollInFlight = true
         defer { isPollInFlight = false }
 
+        let handle = OPCUAHandle(ptr: capturedClient)
         // Snapshot keys on MainActor before yielding into the queue.
         let nodeIds = Array(tagCallbacks.keys)
 
@@ -220,7 +283,7 @@ class OPCUAClientService: ObservableObject {
                 // Process any pending network events (keepalives, incoming data).
                 // This is required to prevent the OPC-UA secure channel from expiring
                 // when the client sits idle between polls. Timeout = 0 → non-blocking.
-                UA_Client_run_iterate(capturedClient, 0)
+                UA_Client_run_iterate(handle.ptr, 0)
 
                 var results: [(nodeId: String, value: TagValue, quality: TagQuality, timestamp: Date)] = []
 
@@ -234,10 +297,15 @@ class OPCUAClientService: ObservableObject {
 
                     let nodeIdC = UA_NODEID_NUMERIC(ns, id)
                     var variant = UA_Variant()
-                    if UA_Client_readValueAttribute(capturedClient, nodeIdC, &variant) == UA_STATUSCODE_GOOD {
+                    let readStatus = UA_Client_readValueAttribute(handle.ptr, nodeIdC, &variant)
+                    if readStatus == UA_STATUSCODE_GOOD {
                         let tagValue = self.convertVariantToTagValue(&variant)
                         UA_Variant_clear(&variant)
                         results.append((nodeId, tagValue, .good, Date()))
+                    } else {
+                        // Read failed (node gone, session issue, etc.) — mark tag uncertain
+                        // so the operator sees data is no longer live, rather than stale-good.
+                        results.append((nodeId, .none, .uncertain, Date()))
                     }
                 }
 
@@ -261,11 +329,74 @@ class OPCUAClientService: ObservableObject {
 
     // MARK: - Read/Write Operations
 
+    /// Write a value to an OPC-UA variable node.
+    /// Dispatches on opcuaQueue (same serial queue as all other C calls).
+    func writeTag(nodeId: String, value: TagValue) async throws {
+        guard let capturedClient = client, connectionState == .connected else {
+            throw OPCUAError.notConnected
+        }
+
+        let handle = OPCUAHandle(ptr: capturedClient)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            self.opcuaQueue.async {
+                // --- Parse NodeId (same logic as read/poll paths) ---
+                var nodeIdC = UA_NODEID_NULL
+                if nodeId.contains("i=") {
+                    var ns: UInt16 = 0; var id: UInt32 = 0
+                    for part in nodeId.split(separator: ";") {
+                        if part.hasPrefix("ns=") { ns = UInt16(part.dropFirst(3)) ?? 0 }
+                        else if part.hasPrefix("i=") { id = UInt32(part.dropFirst(2)) ?? 0 }
+                    }
+                    nodeIdC = UA_NODEID_NUMERIC(ns, id)
+                } else if nodeId.contains("s=") {
+                    var ns: UInt16 = 0; var stringId = ""
+                    for part in nodeId.split(separator: ";") {
+                        if part.hasPrefix("ns=") { ns = UInt16(part.dropFirst(3)) ?? 0 }
+                        else if part.hasPrefix("s=") { stringId = String(part.dropFirst(2)) }
+                    }
+                    nodeIdC = UA_NODEID_STRING_ALLOC(ns, stringId)
+                } else {
+                    nodeIdC = UA_NODEID_STRING_ALLOC(0, nodeId)
+                }
+                defer { UA_NodeId_clear(&nodeIdC) }
+
+                // --- Build UA_Variant from TagValue ---
+                // copc_type_*() helpers resolve UA_TYPES[index] in C (avoids Swift tuple-subscript).
+                var variant = UA_Variant()
+                UA_Variant_init(&variant)
+                defer { UA_Variant_clear(&variant) }
+
+                switch value {
+                case .analog(let d):
+                    var v = d
+                    UA_Variant_setScalarCopy(&variant, &v, copc_type_double())
+                case .digital(let b):
+                    var v: UA_Boolean = b   // UA_Boolean maps to Swift Bool
+                    UA_Variant_setScalarCopy(&variant, &v, copc_type_boolean())
+                case .string, .none:
+                    continuation.resume(throwing: OPCUAError.writeError(
+                        "Cannot write \(value) — only analog and digital values are supported"))
+                    return
+                }
+
+                // --- Execute write ---
+                let status = UA_Client_writeValueAttribute(handle.ptr, nodeIdC, &variant)
+                if status == UA_STATUSCODE_GOOD {
+                    continuation.resume()
+                } else {
+                    let hex = "0x\(String(format: "%08X", status))"
+                    continuation.resume(throwing: OPCUAError.writeError("Write failed: \(hex)"))
+                }
+            }
+        }
+    }
+
     private func readTag(nodeId: String) async throws -> (TagValue, TagQuality, Date) {
         guard let capturedClient = client else {
             throw OPCUAError.notConnected
         }
 
+        let handle = OPCUAHandle(ptr: capturedClient)
         return try await withCheckedThrowingContinuation { continuation in
             self.opcuaQueue.async {
                 var ns: UInt16 = 0
@@ -277,7 +408,7 @@ class OPCUAClientService: ObservableObject {
 
                 let nodeIdC = UA_NODEID_NUMERIC(ns, id)
                 var value  = UA_Variant()
-                let retval = UA_Client_readValueAttribute(capturedClient, nodeIdC, &value)
+                let retval = UA_Client_readValueAttribute(handle.ptr, nodeIdC, &value)
 
                 if retval == UA_STATUSCODE_GOOD {
                     let tagValue = self.convertVariantToTagValue(&value)
@@ -460,6 +591,7 @@ class OPCUAClientService: ObservableObject {
             throw OPCUAError.notConnected
         }
 
+        let handle = OPCUAHandle(ptr: capturedClient)
         return try await withCheckedThrowingContinuation { continuation in
             self.opcuaQueue.async {
                 // Parse NodeId
@@ -512,7 +644,7 @@ class OPCUAClientService: ObservableObject {
                 browseRequest.nodesToBrowse     = descPtr
                 browseRequest.nodesToBrowseSize = 1
 
-                var browseResponse = UA_Client_Service_browse(capturedClient, browseRequest)
+                var browseResponse = UA_Client_Service_browse(handle.ptr, browseRequest)
                 defer {
                     UA_BrowseRequest_clear(&browseRequest)
                     UA_BrowseResponse_clear(&browseResponse)

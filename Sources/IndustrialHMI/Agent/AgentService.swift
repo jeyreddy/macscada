@@ -1,5 +1,87 @@
 import Foundation
-import Security
+
+// MARK: - AgentService.swift
+//
+// Claude AI integration for the IndustrialHMI operator assistant.
+//
+// ── Overview ──────────────────────────────────────────────────────────────────
+//   AgentService connects to the Anthropic Messages API (claude-sonnet-4-6) and
+//   provides a multi-turn agentic conversation loop with 25+ HMI tool calls.
+//   It is the backend for AgentView (text chat UI) and MultimodalInputService
+//   (voice/gesture input forwarding).
+//
+// ── Agentic loop ──────────────────────────────────────────────────────────────
+//   sendMessage(text:imageBase64:) is the single public entry point.
+//   runAgentLoop() iterates up to maxAgentLoopIterations (20) until the API
+//   returns stop_reason = "end_turn" or no more tool_use blocks:
+//
+//     1. callAPI() → POST /v1/messages with conversationHistory + tool definitions
+//     2. Parse MessagesResponse.content for text blocks and tool_use blocks
+//     3. Show text in chat as .assistant(text:)
+//     4. For each tool_use block: executeTool() → append .toolCall + .toolResult UI
+//     5. Append tool results to history as a "user" turn (Anthropic agentic pattern)
+//     6. Loop back to step 1 until end_turn
+//
+// ── Tool catalog (25 tools) ───────────────────────────────────────────────────
+//   System:
+//     get_system_status         — OPC-UA state, tag count, alarm counts
+//
+//   Tags:
+//     list_tags                 — filtered/searched tag list with values + quality
+//     get_tag_detail            — full detail for one tag
+//     update_tag_metadata       — set unit, description
+//     create_calculated_tag     — create an expression-based derived tag
+//     create_totalizer_tag      — create a running accumulator tag
+//     reset_totalizer           — reset accumulator to zero
+//     delete_tag                — remove a tag
+//     write_tag_values          — write one or more tag values (requires operator role)
+//     get_tag_history           — query Historian for historical samples
+//
+//   Alarms:
+//     list_alarm_configs        — all alarm setpoint configs
+//     get_alarm_config          — config for one tag
+//     create_alarm_config       — create/replace alarm config for a tag
+//     update_alarm_config       — modify thresholds, deadband, priority
+//     delete_alarm_config       — remove alarm config
+//     acknowledge_alarm         — ack one active alarm by tag name
+//     acknowledge_all_alarms    — ack all unacknowledged alarms
+//     shelve_alarm              — ISA-18.2 temporary suppression
+//     unshelve_alarm            — restore shelved alarm to service
+//     put_alarm_out_of_service  — maintenance mode
+//     return_alarm_to_service   — restore OOS alarm
+//
+//   HMI Objects:
+//     list_hmi_objects          — all objects on current screen
+//     create_hmi_object         — add a new object to the designer
+//     update_hmi_object         — modify object properties
+//     delete_hmi_object         — remove an object
+//
+//   Navigation:
+//     navigate_to_tab           — switch the app to a specific tab
+//     set_opcua_connection      — change server URL and reconnect
+//
+//   Recipes:
+//     list_recipes              — all saved recipes with setpoints
+//     activate_recipe           — apply a recipe to the live process
+//
+// ── API key storage ───────────────────────────────────────────────────────────
+//   Primary:  ~/Library/Application Support/IndustrialHMI/.agentkey (mode 0600)
+//   Fallback: in-memory sessionKey (if operator chose not to persist, or file failed)
+//   hasAPIKey = true means the key is available via loadAPIKey().
+//
+// ── Conversation history ──────────────────────────────────────────────────────
+//   conversationHistory is a rolling window of up to maxHistory (40) APIMessages.
+//   Older messages are dropped from the front of the array to stay within context limits.
+//   The UI message list (messages: [AgentMessage]) is append-only and never truncated.
+//
+// ── Error handling ────────────────────────────────────────────────────────────
+//   callAPI() throws AgentError typed errors.  Tool errors are caught individually
+//   inside executeTool() and returned as ToolResult(isError: true) so the agent
+//   sees the error text and can respond gracefully without crashing the loop.
+//
+// ── System prompt ─────────────────────────────────────────────────────────────
+//   Defined in `systemPrompt` computed property — describes the operator assistant
+//   role, safety constraints, and formatting preferences.
 
 // MARK: - AgentService
 
@@ -22,6 +104,12 @@ class AgentService: ObservableObject {
     /// Set by MainView.onAppear — lets tools switch tabs.
     var navigateToTab: ((Tab) -> Void)?
 
+    /// Injected by DataService after init — provides recipe list and activation.
+    var recipeStore: RecipeStore?
+
+    /// Injected by DataService after init — executes OPC-UA write + historian log.
+    var confirmWrite: ((WriteRequest) async throws -> Void)?
+
     // MARK: - Conversation (rolling window, 40 messages max)
 
     private var conversationHistory: [APIMessage] = []
@@ -34,10 +122,20 @@ class AgentService: ObservableObject {
     private let maxTokens = 4096
     private let maxAgentLoopIterations = 20
 
-    // MARK: - Keychain
+    // MARK: - API Key storage
+    // Primary: file at ~/Library/Application Support/IndustrialHMI/.agentkey (mode 0600)
+    // Fallback: in-memory session key (user opted for session-only, or file write failed)
 
-    private let keychainService = "com.industrialhmi.agent"
-    private let keychainAccount = "anthropic-api-key"
+    private static let apiKeyFileURL: URL = {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory,
+                                               in: .userDomainMask).first!
+        return support
+            .appendingPathComponent("IndustrialHMI", isDirectory: true)
+            .appendingPathComponent(".agentkey")
+    }()
+
+    /// Session-only key — used when the user chose not to persist, or file write failed.
+    private var sessionKey: String? = nil
 
     // MARK: - Init
 
@@ -49,55 +147,53 @@ class AgentService: ObservableObject {
         self.alarmManager   = alarmManager
         self.hmiScreenStore = hmiScreenStore
         self.opcuaService   = opcuaService
-        self.hasAPIKey      = loadAPIKey() != nil
+        self.hasAPIKey      = Self.loadFromFile() != nil
     }
 
-    // MARK: - Keychain
+    // MARK: - API Key CRUD
 
-    func saveAPIKey(_ key: String) {
-        let data = Data(key.utf8)
-        // Remove existing entry first (avoids errSecDuplicateItem)
-        let deleteQuery: [CFString: Any] = [
-            kSecClass:       kSecClassGenericPassword,
-            kSecAttrService: keychainService,
-            kSecAttrAccount: keychainAccount
-        ]
-        SecItemDelete(deleteQuery as CFDictionary)
+    func saveAPIKey(_ key: String, sessionOnly: Bool = false) {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
 
-        let addQuery: [CFString: Any] = [
-            kSecClass:          kSecClassGenericPassword,
-            kSecAttrService:    keychainService,
-            kSecAttrAccount:    keychainAccount,
-            kSecValueData:      data,
-            kSecAttrAccessible: kSecAttrAccessibleWhenUnlocked
-        ]
-        let status = SecItemAdd(addQuery as CFDictionary, nil)
-        hasAPIKey = (status == errSecSuccess)
+        if sessionOnly {
+            sessionKey = trimmed
+            hasAPIKey  = true
+            Logger.shared.info("AgentService: API key stored for this session only")
+            return
+        }
+
+        let url = Self.apiKeyFileURL
+        do {
+            let dir = url.deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try Data(trimmed.utf8).write(to: url)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            hasAPIKey = true
+            Logger.shared.info("AgentService: API key saved to file")
+        } catch {
+            sessionKey = trimmed
+            hasAPIKey  = true
+            Logger.shared.error("AgentService: file save failed (\(error)) — key kept for this session only")
+        }
     }
 
     func loadAPIKey() -> String? {
-        let query: [CFString: Any] = [
-            kSecClass:       kSecClassGenericPassword,
-            kSecAttrService: keychainService,
-            kSecAttrAccount: keychainAccount,
-            kSecReturnData:  true,
-            kSecMatchLimit:  kSecMatchLimitOne
-        ]
-        var result: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data,
-              let key  = String(data: data, encoding: .utf8) else { return nil }
-        return key
+        if let k = sessionKey { return k }
+        return Self.loadFromFile()
     }
 
     func deleteAPIKey() {
-        let query: [CFString: Any] = [
-            kSecClass:       kSecClassGenericPassword,
-            kSecAttrService: keychainService,
-            kSecAttrAccount: keychainAccount
-        ]
-        SecItemDelete(query as CFDictionary)
+        sessionKey = nil
+        try? FileManager.default.removeItem(at: Self.apiKeyFileURL)
         hasAPIKey = false
+    }
+
+    private static func loadFromFile() -> String? {
+        guard let data = try? Data(contentsOf: apiKeyFileURL),
+              let key  = String(data: data, encoding: .utf8) else { return nil }
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     // MARK: - Public entry point
@@ -232,8 +328,21 @@ class AgentService: ObservableObject {
             case "create_hmi_object":      return try toolCreateHMIObject(input: input)
             case "update_hmi_object":      return try toolUpdateHMIObject(input: input)
             case "delete_hmi_object":      return try toolDeleteHMIObject(input: input)
-            case "navigate_to_tab":        return try toolNavigateToTab(input: input)
-            case "set_opcua_connection":   return try await toolSetOPCUAConnection(input: input)
+            case "navigate_to_tab":            return try    toolNavigateToTab(input: input)
+            case "set_opcua_connection":       return try await toolSetOPCUAConnection(input: input)
+            // Phase 12 — Power Tools
+            case "list_recipes":               return try    toolListRecipes()
+            case "activate_recipe":            return try await toolActivateRecipe(input: input)
+            case "shelve_alarm":               return try    toolShelveAlarm(input: input)
+            case "unshelve_alarm":             return try    toolUnshelveAlarm(input: input)
+            case "put_alarm_out_of_service":   return try    toolPutAlarmOutOfService(input: input)
+            case "return_alarm_to_service":    return try    toolReturnAlarmToService(input: input)
+            case "get_tag_history":            return try await toolGetTagHistory(input: input)
+            case "create_calculated_tag":      return try    toolCreateCalculatedTag(input: input)
+            case "create_totalizer_tag":       return try    toolCreateTotalizerTag(input: input)
+            case "reset_totalizer":            return try    toolResetTotalizer(input: input)
+            case "delete_tag":                 return try    toolDeleteTag(input: input)
+            case "write_tag_values":           return try await toolWriteTagValues(input: input)
             default:
                 return err("Unknown tool: \(name)")
             }
@@ -468,16 +577,20 @@ class AgentService: ObservableObject {
         case "monitor":  tab = .monitor
         case "trends":   tab = .trends
         case "alarms":   tab = .alarms
+        case "recipes":  tab = .recipes
         case "hmi":      tab = .hmi
         case "settings": tab = .settings
         case "agent":    tab = .agent
-        default:         tab = nil
+        case "auditLog":   tab = .auditLog
+        case "community":  tab = .community
+        case "scheduler":  tab = .scheduler
+        default:           tab = nil
         }
         if let t = tab {
             navigateToTab?(t)
             return ok(["navigated_to": tabStr], "Navigated to \(tabStr)")
         } else {
-            return err("Unknown tab: \(tabStr). Valid: monitor, trends, alarms, hmi, settings, agent")
+            return err("Unknown tab: \(tabStr). Valid: monitor, trends, alarms, community, auditLog, recipes, scheduler, hmi, settings, agent")
         }
     }
 
@@ -653,6 +766,247 @@ class AgentService: ObservableObject {
             .joined(separator: ", ")
     }
 
+    // MARK: - Phase 12: Recipe Tools
+
+    private func toolListRecipes() throws -> ToolResult {
+        guard let store = recipeStore else { return err("Recipe store not available.") }
+        let fmt = ISO8601DateFormatter()
+        let list: [[String: Any]] = store.recipes.map { r in
+            var d: [String: Any] = [
+                "name":           r.name,
+                "setpoint_count": r.setpoints.count,
+                "version":        r.version,
+                "last_activated": r.lastActivatedAt.map { fmt.string(from: $0) } ?? "Never",
+                "last_activated_by": r.lastActivatedBy ?? "—"
+            ]
+            if !r.description.isEmpty { d["description"] = r.description }
+            return d
+        }
+        return ok(["recipes": list, "count": list.count],
+                  list.isEmpty ? "No recipes configured." : "Found \(list.count) recipe(s).")
+    }
+
+    private func toolActivateRecipe(input: [String: AnyCodable]) async throws -> ToolResult {
+        guard let name = strArg(input, "recipe_name") else {
+            throw AgentError.missingParameter("recipe_name")
+        }
+        guard let store = recipeStore else { return err("Recipe store not available.") }
+        guard let recipe = store.recipes.first(where: { $0.name == name }) else {
+            let available = store.recipes.map(\.name).joined(separator: ", ")
+            return err("Recipe '\(name)' not found. Available: \(available.isEmpty ? "none" : available)")
+        }
+        let opName = (input["operator_name"]?.value as? String) ?? "AI Agent"
+        let result = await store.activateRecipe(recipe, by: opName)
+        let failedList = result.failed.map {
+            ["tag_name": $0.tagName, "reason": $0.reason] as [String: Any]
+        }
+        let d: [String: Any] = [
+            "recipe_name":     name,
+            "total_setpoints": result.recipe.setpoints.count,
+            "succeeded_count": result.succeeded.count,
+            "succeeded_tags":  result.succeeded,
+            "failed_count":    result.failed.count,
+            "failed":          failedList
+        ]
+        return ok(d, "Recipe '\(name)': \(result.succeeded.count)/\(result.recipe.setpoints.count) setpoints written successfully.")
+    }
+
+    // MARK: - Phase 12: Alarm Shelve / OOS Tools
+
+    private func toolShelveAlarm(input: [String: AnyCodable]) throws -> ToolResult {
+        guard let tagName = strArg(input, "tag_name") else {
+            throw AgentError.missingParameter("tag_name")
+        }
+        guard let alarm = alarmManager.activeAlarms.first(where: { $0.tagName == tagName }) else {
+            return err("No active alarm found for tag '\(tagName)'.")
+        }
+        let hours    = dblArg(input, "duration_hours")
+        let reason   = input["reason"]?.value as? String
+        let duration = hours.map { $0 * 3600 }
+        alarmManager.shelveAlarm(alarm, by: "AI Agent", duration: duration, reason: reason)
+        let durStr = hours.map { " for \(Int($0))h" } ?? " indefinitely"
+        return ok(["shelved": tagName], "Alarm for '\(tagName)' shelved\(durStr).")
+    }
+
+    private func toolUnshelveAlarm(input: [String: AnyCodable]) throws -> ToolResult {
+        guard let tagName = strArg(input, "tag_name") else {
+            throw AgentError.missingParameter("tag_name")
+        }
+        guard let alarm = alarmManager.shelvedAlarms.first(where: { $0.tagName == tagName }) else {
+            return err("No shelved alarm found for tag '\(tagName)'.")
+        }
+        alarmManager.unshelveAlarm(id: alarm.id, by: "AI Agent")
+        return ok(["unshelved": tagName], "Alarm for '\(tagName)' unshelved and returned to normal monitoring.")
+    }
+
+    private func toolPutAlarmOutOfService(input: [String: AnyCodable]) throws -> ToolResult {
+        guard let tagName = strArg(input, "tag_name") else {
+            throw AgentError.missingParameter("tag_name")
+        }
+        guard let config = alarmManager.alarmConfigs.first(where: { $0.tagName == tagName }) else {
+            return err("No alarm config found for tag '\(tagName)'.")
+        }
+        let reason = input["reason"]?.value as? String
+        alarmManager.putOutOfService(config.id, by: "AI Agent", reason: reason)
+        return ok(["out_of_service": tagName], "Alarm for '\(tagName)' put out of service (ISA-18.2 OOS).")
+    }
+
+    private func toolReturnAlarmToService(input: [String: AnyCodable]) throws -> ToolResult {
+        guard let tagName = strArg(input, "tag_name") else {
+            throw AgentError.missingParameter("tag_name")
+        }
+        guard let config = alarmManager.alarmConfigs.first(where: { $0.tagName == tagName }) else {
+            return err("No alarm config found for tag '\(tagName)'.")
+        }
+        alarmManager.returnToService(config.id, by: "AI Agent")
+        return ok(["returned_to_service": tagName], "Alarm for '\(tagName)' returned to service.")
+    }
+
+    // MARK: - Phase 12: Historical Data Tool
+
+    private func toolGetTagHistory(input: [String: AnyCodable]) async throws -> ToolResult {
+        // tag_names can arrive as [String] or [Any] from JSON decoding
+        let raw = input["tag_names"]?.value
+        var tagNames: [String] = []
+        if let arr = raw as? [Any] {
+            tagNames = arr.compactMap { $0 as? String }
+        } else if let s = raw as? String {
+            tagNames = [s]
+        }
+        guard !tagNames.isEmpty else { throw AgentError.missingParameter("tag_names") }
+
+        let hours = dblArg(input, "hours") ?? 24.0
+        let from  = Date().addingTimeInterval(-hours * 3600)
+        let data  = await tagEngine.getHistoricalData(
+            for: tagNames, from: from, to: Date(), maxPoints: 2000
+        )
+        let fmt = ISO8601DateFormatter()
+        var summary: [String: Any] = [:]
+        for tagName in tagNames {
+            let pts = data[tagName] ?? []
+            if pts.isEmpty {
+                summary[tagName] = ["count": 0, "note": "No historical data found in the requested range."]
+            } else {
+                let vals = pts.map(\.value)
+                summary[tagName] = [
+                    "count":      pts.count,
+                    "min":        vals.min()!,
+                    "max":        vals.max()!,
+                    "average":    vals.reduce(0, +) / Double(vals.count),
+                    "last_value": vals.last!,
+                    "from":       fmt.string(from: from),
+                    "to":         fmt.string(from: Date())
+                ]
+            }
+        }
+        return ok(["hours": hours, "tags": summary],
+                  "Historical summary for \(tagNames.count) tag(s) over last \(Int(hours))h.")
+    }
+
+    // MARK: - Phase 12: Calculated / Totalizer Tag Tools
+
+    private func toolCreateCalculatedTag(input: [String: AnyCodable]) throws -> ToolResult {
+        guard let name       = strArg(input, "name")       else { throw AgentError.missingParameter("name") }
+        guard let expression = strArg(input, "expression") else { throw AgentError.missingParameter("expression") }
+        let unit        = input["unit"]?.value        as? String
+        let description = input["description"]?.value as? String
+        do {
+            try tagEngine.addCalculatedTag(name: name, expression: expression,
+                                           unit: unit, description: description, dataType: .calculated)
+            return ok(["created": name, "expression": expression],
+                      "Calculated tag '\(name)' created with expression: \(expression)")
+        } catch {
+            return err("Failed to create calculated tag '\(name)': \(error.localizedDescription)")
+        }
+    }
+
+    private func toolCreateTotalizerTag(input: [String: AnyCodable]) throws -> ToolResult {
+        guard let name          = strArg(input, "name")            else { throw AgentError.missingParameter("name") }
+        guard let sourceTagName = strArg(input, "source_tag_name") else { throw AgentError.missingParameter("source_tag_name") }
+        let unit        = input["unit"]?.value        as? String
+        let description = input["description"]?.value as? String
+        do {
+            try tagEngine.addTotalizerTag(name: name, sourceTagName: sourceTagName,
+                                          unit: unit, description: description)
+            return ok(["created": name, "source_tag_name": sourceTagName],
+                      "Totalizer tag '\(name)' created. It will integrate '\(sourceTagName)' over time (∑ value × Δt).")
+        } catch {
+            return err("Failed to create totalizer '\(name)': \(error.localizedDescription)")
+        }
+    }
+
+    private func toolResetTotalizer(input: [String: AnyCodable]) throws -> ToolResult {
+        guard let tagName = strArg(input, "tag_name") else { throw AgentError.missingParameter("tag_name") }
+        guard let tag = tagEngine.getTag(named: tagName) else { return err("Tag '\(tagName)' not found.") }
+        guard tag.dataType == .totalizer else {
+            return err("Tag '\(tagName)' is not a totalizer (type: \(tag.dataType.rawValue)).")
+        }
+        tagEngine.resetTotalizer(name: tagName)
+        return ok(["reset": tagName], "Totalizer '\(tagName)' reset to 0.")
+    }
+
+    private func toolDeleteTag(input: [String: AnyCodable]) throws -> ToolResult {
+        guard let tagName = strArg(input, "tag_name") else { throw AgentError.missingParameter("tag_name") }
+        guard let tag = tagEngine.getTag(named: tagName) else { return err("Tag '\(tagName)' not found.") }
+        switch tag.dataType {
+        case .calculated:
+            tagEngine.removeCalculatedTag(name: tagName)
+            return ok(["deleted": tagName], "Calculated tag '\(tagName)' deleted.")
+        case .totalizer:
+            tagEngine.removeTotalizerTag(name: tagName)
+            return ok(["deleted": tagName], "Totalizer tag '\(tagName)' deleted.")
+        default:
+            return err("Tag '\(tagName)' is a hardware tag (type: \(tag.dataType.rawValue)). Only calculated and totalizer tags can be deleted via agent.")
+        }
+    }
+
+    // MARK: - Phase 12: Batch Write Tool
+
+    private func toolWriteTagValues(input: [String: AnyCodable]) async throws -> ToolResult {
+        guard let writeFn = confirmWrite else {
+            return err("Write function not available — please restart the application.")
+        }
+        let raw = input["writes"]?.value
+        guard let writesRaw = raw as? [Any], !writesRaw.isEmpty else {
+            throw AgentError.missingParameter("writes")
+        }
+        let opName = (input["operator_name"]?.value as? String) ?? "AI Agent"
+
+        var succeeded: [String]       = []
+        var failed:    [[String: Any]] = []
+
+        for item in writesRaw {
+            guard let dict    = item as? [String: Any],
+                  let tagName = dict["tag_name"] as? String,
+                  let value   = dict["value"] as? Double else {
+                failed.append(["tag_name": "unknown", "reason": "Invalid entry format (need tag_name and value)."])
+                continue
+            }
+            guard let req = tagEngine.requestWrite(
+                tagName: tagName, newValue: .analog(value), requestedBy: opName
+            ) else {
+                failed.append(["tag_name": tagName, "reason": "Tag not found."])
+                continue
+            }
+            do {
+                try await writeFn(req)
+                succeeded.append(tagName)
+            } catch {
+                tagEngine.cancelWrite(req)
+                failed.append(["tag_name": tagName, "reason": error.localizedDescription])
+            }
+        }
+
+        let d: [String: Any] = [
+            "total":           writesRaw.count,
+            "succeeded_count": succeeded.count,
+            "succeeded":       succeeded,
+            "failed_count":    failed.count,
+            "failed":          failed
+        ]
+        return ok(d, "Batch write: \(succeeded.count)/\(writesRaw.count) tag(s) written successfully.")
+    }
+
     // MARK: - System Prompt
 
     private let systemPrompt = """
@@ -662,9 +1016,15 @@ class AgentService: ObservableObject {
     ## Your Capabilities
     - Query real-time tag values, connection status, alarm states, and system statistics
     - Configure alarm setpoints (high-high/critical, high/warning, low/warning, low-low/critical, deadband, priority)
+    - Acknowledge, shelve, unshelve, put out-of-service, and return alarms to service (ISA-18.2)
     - Update tag metadata: engineering units and descriptions
+    - Create calculated tags (formula expressions, e.g. avg(TempA, TempB) or TempA + Offset)
+    - Create totalizer tags that accumulate ∑(source_value × Δt) over time (e.g. flow totalizers); reset them on demand
+    - Delete calculated or totalizer tags (hardware/OPC-UA tags cannot be deleted via agent)
+    - Batch-write values to multiple tags in a single operation
+    - List and activate recipes (batch setpoint downloads to multiple tags)
+    - Query historical trend data: min/avg/max/last values over a time range
     - Design and modify HMI screens: create, update, or delete graphical objects on the canvas
-    - Acknowledge alarms (single or all) on behalf of the operator
     - Navigate the application to relevant views
     - Connect/disconnect the OPC-UA server, control polling
 
@@ -680,6 +1040,9 @@ class AgentService: ObservableObject {
     green={r:0,g:1,b:0,a:1}, blue={r:0.27,g:0.51,b:0.71,a:1}, dark background={r:0.08,g:0.08,b:0.12,a:1}.
     8. This is a safety-critical industrial environment. Be precise. Confirm before making large bulk changes.
     9. If a tag is not found, say so and list available tags.
+    10. Totalizer tags accumulate value·time automatically; use reset_totalizer to zero them. \
+    Source tag must already exist before creating a totalizer.
+    11. For batch writes, the agent is logged as the operator; all writes appear in the Audit Log.
     """
 }
 
@@ -810,14 +1173,107 @@ enum AgentTools {
         tool("navigate_to_tab",
              "Switches the main application tab.",
              properties: [
-                "tab": strEnum(["monitor","trends","alarms","hmi","settings","agent"], "Tab to navigate to.")
+                "tab": strEnum(["monitor","trends","alarms","community","auditLog","recipes","scheduler","hmi","settings","agent"], "Tab to navigate to.")
              ], required: ["tab"]),
 
         tool("set_opcua_connection",
              "Connects to or disconnects from the OPC-UA server, or controls polling.",
              properties: [
                 "action": strEnum(["connect","disconnect","start_polling","pause_polling"], "Action to perform.")
-             ], required: ["action"])
+             ], required: ["action"]),
+
+        // Phase 12 — Power Tools
+
+        tool("list_recipes",
+             "Lists all saved recipes with name, setpoint count, and last activation info.",
+             properties: [:], required: []),
+
+        tool("activate_recipe",
+             "Activates a recipe by name, writing all its setpoints to their target tags.",
+             properties: [
+                "recipe_name":   str("Exact recipe name (case-sensitive)."),
+                "operator_name": str("Operator to log the activation as. Default: 'AI Agent'.")
+             ], required: ["recipe_name"]),
+
+        tool("shelve_alarm",
+             "Shelves (temporarily suppresses) an active alarm for a tag (ISA-18.2 shelving).",
+             properties: [
+                "tag_name":       str("Tag name with the active alarm to shelve."),
+                "duration_hours": num("Shelve duration in hours. Omit for indefinite shelving."),
+                "reason":         str("Reason for shelving, recorded in the alarm journal.")
+             ], required: ["tag_name"]),
+
+        tool("unshelve_alarm",
+             "Manually unshelves a shelved alarm, returning it to normal monitoring.",
+             properties: ["tag_name": str("Tag name of the shelved alarm.")],
+             required: ["tag_name"]),
+
+        tool("put_alarm_out_of_service",
+             "Puts an alarm config out of service (ISA-18.2 OOS) — alarm detection is fully suppressed until returned.",
+             properties: [
+                "tag_name": str("Tag whose alarm config to put out of service."),
+                "reason":   str("Maintenance or calibration reason (audit trail).")
+             ], required: ["tag_name"]),
+
+        tool("return_alarm_to_service",
+             "Returns an alarm config from out-of-service back to normal alarm monitoring.",
+             properties: ["tag_name": str("Tag name to return to service.")],
+             required: ["tag_name"]),
+
+        tool("get_tag_history",
+             "Returns aggregated historical data (min/avg/max/last/count) for one or more tags over a time window.",
+             properties: [
+                "tag_names": ["type": "array",
+                              "items": ["type": "string"] as [String: Any],
+                              "description": "Tag names to query (case-sensitive)."] as [String: Any],
+                "hours": num("Hours of history to retrieve. Default: 24.")
+             ], required: ["tag_names"]),
+
+        tool("create_calculated_tag",
+             "Creates a new tag whose live value is computed from a formula over other tag values. " +
+             "Supported: arithmetic (+,-,*,/), comparison, logic, ternary, IF/THEN/ELSE, " +
+             "and functions: abs, sqrt, round, floor, ceil, sign, min, max, avg, sum, clamp.",
+             properties: [
+                "name":        str("Unique tag name for the calculated tag."),
+                "expression":  str("Formula, e.g. 'avg(TempA, TempB)' or '(Flow1 + Flow2) / 2'."),
+                "unit":        str("Engineering unit (optional)."),
+                "description": str("Human-readable description (optional).")
+             ], required: ["name", "expression"]),
+
+        tool("create_totalizer_tag",
+             "Creates a totalizer tag that continuously integrates a source tag value over time: " +
+             "accumulated = ∑(source_value × Δt). Useful for flow totalizers, energy accumulators, etc. " +
+             "The source tag must already exist. Use reset_totalizer to zero the accumulator.",
+             properties: [
+                "name":            str("Unique name for the totalizer tag."),
+                "source_tag_name": str("Name of the tag whose value is integrated (must exist)."),
+                "unit":            str("Engineering unit for the accumulated result, e.g. 'm³', 'kWh'."),
+                "description":     str("Description (optional).")
+             ], required: ["name", "source_tag_name"]),
+
+        tool("reset_totalizer",
+             "Resets a totalizer tag's accumulated value back to zero.",
+             properties: ["tag_name": str("Name of the totalizer tag to reset.")],
+             required: ["tag_name"]),
+
+        tool("delete_tag",
+             "Deletes a calculated or totalizer tag. Hardware/OPC-UA/Modbus/MQTT tags cannot be deleted via agent.",
+             properties: ["tag_name": str("Name of the calculated or totalizer tag to delete.")],
+             required: ["tag_name"]),
+
+        tool("write_tag_values",
+             "Batch-writes values to multiple tags in a single operation. All writes are logged to the Audit Log.",
+             properties: [
+                "writes": ["type": "array",
+                           "description": "List of {tag_name, value} write pairs.",
+                           "items": ["type": "object",
+                                     "properties": [
+                                        "tag_name": ["type": "string", "description": "Exact tag name."],
+                                        "value":    ["type": "number", "description": "Numeric value to write."]
+                                     ] as [String: Any],
+                                     "required": ["tag_name", "value"]] as [String: Any]] as [String: Any],
+                "operator_name": str("Operator to record in the write audit log. Default: 'AI Agent'.")
+             ], required: ["writes"])
     ]
 
     // MARK: - Schema builder helpers

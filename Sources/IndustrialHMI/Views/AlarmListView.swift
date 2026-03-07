@@ -1,3 +1,44 @@
+// MARK: - AlarmListView.swift
+//
+// Consolidated alarm management screen combining active alarms, shelved alarms,
+// alarm history, and remote alarms from community federation peers.
+//
+// ── Layout ────────────────────────────────────────────────────────────────────
+//   VStack:
+//     headerBar      — filter chips (All/Active/Historical), severity filter,
+//                      unack-only toggle, "Ack All" button, config + export buttons
+//     alarmTable     — sortable Table<Alarm> with columns: severity icon, tag name,
+//                      message, state badge, trigger time, acknowledged by
+//     remoteAlarmsSection — shown only when communityService.remoteAlarms non-empty;
+//                           compact list of alarms from federated peers
+//
+// ── Alarm Filter ──────────────────────────────────────────────────────────────
+//   AlarmFilter: .all, .active, .historical
+//   .all:       alarmManager.activeAlarms + alarmHistory combined, deduped by id
+//   .active:    alarmManager.activeAlarms + alarmManager.shelvedAlarms
+//   .historical: alarmManager.alarmHistory
+//   selectedSeverity: further filters by AlarmSeverity (nil = show all severities)
+//   showOnlyUnacknowledged: filters to state.requiresAction = true
+//
+// ── Alarm Table ───────────────────────────────────────────────────────────────
+//   Sortable by trigger time (default: newest first), severity, state, tag name.
+//   Row context menu: Acknowledge, Shelve (with duration picker), Unshelve, Details.
+//   "Ack All" button: alarmManager.acknowledgeAllAlarms(by: username).
+//   Role guard: acknowledge/shelve only shown for sessionManager.currentOperator.canAcknowledgeAlarms.
+//
+// ── Alarm Configuration Sheet ─────────────────────────────────────────────────
+//   AlarmConfigSheet (configTag + showConfigSheet) — lets engineers add/edit alarm
+//   thresholds for a specific tag. Accessed via the "Configure" button in the header
+//   or tag row context menu.
+//
+// ── Remote Alarms ─────────────────────────────────────────────────────────────
+//   communityService.remoteAlarms: [Alarm] — received from peer sites.
+//   Shown in a separate section below the main table with a "Remote Site" badge.
+//   Remote alarms cannot be acknowledged locally (read-only display).
+//
+// ── Export ────────────────────────────────────────────────────────────────────
+//   AlarmExportSheet: date range + filter → CSV via CSVBuilder.alarmCSV().
+
 import SwiftUI
 
 // MARK: - Filter
@@ -11,8 +52,11 @@ private enum AlarmFilter: String, CaseIterable {
 // MARK: - AlarmListView
 
 struct AlarmListView: View {
-    @EnvironmentObject var alarmManager: AlarmManager
-    @EnvironmentObject var tagEngine: TagEngine
+    @EnvironmentObject var alarmManager:    AlarmManager
+    @EnvironmentObject var tagEngine:       TagEngine
+    @EnvironmentObject var sessionManager:  SessionManager
+    @EnvironmentObject var dataService:     DataService
+    @EnvironmentObject var communityService: CommunityService
 
     @State private var activeFilter: AlarmFilter  = .active
     @State private var selectedSeverity: AlarmSeverity? = nil
@@ -20,8 +64,9 @@ struct AlarmListView: View {
     @State private var sortOrder: [KeyPathComparator<Alarm>] = [
         KeyPathComparator(\.triggerTime, order: .reverse)
     ]
-    @State private var showConfigSheet = false
-    @State private var configTag: Tag? = nil
+    @State private var showConfigSheet  = false
+    @State private var configTag:  Tag? = nil
+    @State private var showExportSheet  = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -29,6 +74,13 @@ struct AlarmListView: View {
             Divider()
             alarmTable
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            // ── Remote Alarms (Community Federation) ─────────────────────
+            if !communityService.remoteAlarms.isEmpty {
+                Divider()
+                remoteAlarmsSection
+                    .frame(maxWidth: .infinity)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle("Alarms")
@@ -36,6 +88,11 @@ struct AlarmListView: View {
             if let tag = configTag {
                 AlarmConfigSheet(tag: tag).environmentObject(alarmManager)
             }
+        }
+        .sheet(isPresented: $showExportSheet) {
+            AlarmExportSheet()
+                .environmentObject(alarmManager)
+                .environmentObject(dataService)
         }
     }
 
@@ -78,15 +135,25 @@ struct AlarmListView: View {
             Divider().frame(height: 20)
 
             Button("Acknowledge All") {
-                alarmManager.acknowledgeAllAlarms()
+                alarmManager.acknowledgeAllAlarms(by: sessionManager.currentUsername)
+                sessionManager.recordActivity()
             }
-            .disabled(alarmManager.unacknowledgedCount == 0)
+            .disabled(alarmManager.unacknowledgedCount == 0 || !sessionManager.canAcknowledge)
 
             Button("Clear History") {
                 alarmManager.clearAlarmHistory()
             }
+
+            Button {
+                showExportSheet = true
+            } label: {
+                Label("Export", systemImage: "square.and.arrow.up")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Export alarm history to CSV")
         }
-        .padding(10)
+        .padding(HMIStyle.spacingM)
     }
 
     // MARK: - Alarm Table
@@ -107,33 +174,34 @@ struct AlarmListView: View {
                 // Severity
                 TableColumn("Severity", value: \.severity.rawValue) { alarm in
                     HStack(spacing: 5) {
-                        Circle().fill(severityColor(alarm.severity)).frame(width: 8, height: 8)
+                        Circle().fill(HMIStyle.severityColor(alarm.severity))
+                            .frame(width: HMIStyle.qualityDotSize, height: HMIStyle.qualityDotSize)
                         Text(alarm.severity.rawValue)
-                            .font(.caption)
-                            .foregroundColor(severityColor(alarm.severity))
+                            .font(HMIStyle.fieldLabelFont.bold())
+                            .foregroundColor(HMIStyle.severityColor(alarm.severity))
                     }
                 }
                 .width(90)
 
                 // Tag
                 TableColumn("Tag", value: \.tagName) { alarm in
-                    VStack(alignment: .leading, spacing: 1) {
+                    VStack(alignment: .leading, spacing: 2) {
                         Text(alarm.tagName)
-                            .font(.system(.caption, design: .monospaced))
+                            .font(HMIStyle.tagNameFont)
                         // Occurrence count badge
                         let count = occurrenceCount(alarm)
                         if count > 1 {
                             Text("\(count)× occurrences")
-                                .font(.caption2)
+                                .font(HMIStyle.metaFont)
                                 .foregroundColor(.secondary)
                         }
                     }
                 }
-                .width(min: 120)
+                .width(min: 140)
 
                 // Message
                 TableColumn("Message") { alarm in
-                    Text(alarm.message).font(.caption).lineLimit(2)
+                    Text(alarm.message).font(HMIStyle.fieldLabelFont).lineLimit(2)
                 }
                 .width(min: 180)
 
@@ -141,19 +209,19 @@ struct AlarmListView: View {
                 TableColumn("Value") { alarm in
                     if let v = alarm.value {
                         Text(String(format: "%.2f", v))
-                            .font(.system(.caption, design: .monospaced))
+                            .font(HMIStyle.alarmValueFont)
                     } else {
-                        Text("—").foregroundColor(.secondary).font(.caption)
+                        Text("—").foregroundColor(.secondary).font(HMIStyle.fieldLabelFont)
                     }
                 }
                 .width(70)
 
                 // Trigger time
                 TableColumn("Triggered", value: \.triggerTime) { alarm in
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(alarm.triggerTime, style: .time).font(.caption)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(alarm.triggerTime, style: .time).font(HMIStyle.fieldLabelFont)
                         Text(alarm.triggerTime, format: .dateTime.month().day())
-                            .font(.caption2).foregroundColor(.secondary)
+                            .font(HMIStyle.metaFont).foregroundColor(.secondary)
                     }
                 }
                 .width(90)
@@ -161,11 +229,11 @@ struct AlarmListView: View {
                 // State
                 TableColumn("State", value: \.state.rawValue) { alarm in
                     Text(alarm.state.rawValue)
-                        .font(.caption.bold())
-                        .foregroundColor(stateColor(alarm.state))
+                        .font(HMIStyle.fieldLabelFont.bold())
+                        .foregroundColor(HMIStyle.alarmStateColor(alarm.state))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(stateColor(alarm.state).opacity(0.12))
+                        .background(HMIStyle.alarmStateColor(alarm.state).opacity(0.12))
                         .cornerRadius(4)
                 }
                 .width(110)
@@ -173,20 +241,23 @@ struct AlarmListView: View {
                 // Acknowledged by
                 TableColumn("Ack By") { alarm in
                     if let by = alarm.acknowledgedBy {
-                        Text(by).font(.caption).foregroundColor(.secondary)
+                        Text(by).font(HMIStyle.fieldLabelFont).foregroundColor(.secondary)
                     } else {
-                        Text("—").font(.caption).foregroundColor(.secondary)
+                        Text("—").font(HMIStyle.fieldLabelFont).foregroundColor(.secondary)
                     }
                 }
                 .width(80)
 
                 // Action
                 TableColumn("") { alarm in
-                    if alarm.state.requiresAction {
-                        Button("Ack") { alarmManager.acknowledgeAlarm(alarm) }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .tint(alarm.state == .unacknowledgedRTN ? .green : .orange)
+                    if alarm.state.requiresAction && sessionManager.canAcknowledge {
+                        Button("Ack") {
+                            alarmManager.acknowledgeAlarm(alarm, by: sessionManager.currentUsername)
+                            sessionManager.recordActivity()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .tint(alarm.state == .unacknowledgedRTN ? .green : .orange)
                     }
                 }
                 .width(50)
@@ -197,9 +268,9 @@ struct AlarmListView: View {
     // MARK: - Supporting Views
 
     private func countBadge(_ label: String, _ count: Int, _ color: Color) -> some View {
-        VStack(spacing: 1) {
-            Text("\(count)").font(.caption.bold()).foregroundColor(color)
-            Text(label).font(.caption2).foregroundColor(.secondary)
+        VStack(spacing: 2) {
+            Text("\(count)").font(HMIStyle.statusLabelFont).foregroundColor(color)
+            Text(label).font(HMIStyle.metaFont).foregroundColor(.secondary)
         }
     }
 
@@ -258,19 +329,94 @@ struct AlarmListView: View {
         }.count
     }
 
-    // MARK: - Colours
+    // MARK: - Remote Alarms Section
 
-    private func severityColor(_ s: AlarmSeverity) -> Color {
-        switch s { case .critical: return .red; case .warning: return .orange; case .info: return .blue }
+    private var remoteAlarmsSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: HMIStyle.spacingXS) {
+                Image(systemName: "network")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Text("REMOTE ALARMS (\(communityService.remoteAlarms.count))")
+                    .font(HMIStyle.fieldLabelFont.bold())
+                    .foregroundColor(.secondary)
+                    .tracking(0.4)
+                Spacer()
+                Text("Read-only — ack on source instance")
+                    .font(HMIStyle.metaFont)
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, HMIStyle.spacingM)
+            .padding(.vertical, HMIStyle.spacingXS)
+            .background(Color(nsColor: .controlBackgroundColor))
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(communityService.remoteAlarms) { alarm in
+                        RemoteAlarmRow(alarm: alarm)
+                        Divider()
+                    }
+                }
+            }
+            .frame(maxHeight: 180)
+        }
+    }
+}
+
+// MARK: - RemoteAlarmRow
+
+private struct RemoteAlarmRow: View {
+    let alarm: Alarm
+
+    private var siteName: String {
+        alarm.tagName.components(separatedBy: "/").first ?? "Remote"
+    }
+    private var localTagName: String {
+        alarm.tagName.components(separatedBy: "/").dropFirst().joined(separator: "/")
     }
 
-    private func stateColor(_ s: AlarmState) -> Color {
-        switch s {
-        case .unacknowledgedActive: return .red
-        case .acknowledgedActive:   return .yellow
-        case .unacknowledgedRTN:    return .green
-        case .normal:               return .secondary
-        case .suppressed:           return .gray
+    var body: some View {
+        HStack(spacing: HMIStyle.spacingS) {
+            // Severity bar
+            Rectangle()
+                .fill(HMIStyle.severityColor(alarm.severity))
+                .frame(width: 3)
+                .frame(maxHeight: .infinity)
+
+            // Site badge
+            Text(siteName)
+                .font(HMIStyle.metaFont.bold())
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(Color.accentColor.opacity(0.15))
+                .cornerRadius(4)
+                .foregroundColor(.accentColor)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(localTagName)
+                    .font(HMIStyle.tagNameFont)
+                    .foregroundColor(.primary)
+                Text(alarm.message)
+                    .font(HMIStyle.metaFont)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(alarm.severity.rawValue)
+                    .font(HMIStyle.metaFont.bold())
+                    .foregroundColor(HMIStyle.severityColor(alarm.severity))
+                Text(alarm.triggerTime, style: .relative)
+                    .font(HMIStyle.metaFont)
+                    .foregroundColor(.secondary)
+            }
         }
+        .padding(.horizontal, HMIStyle.spacingM)
+        .padding(.vertical, HMIStyle.spacingXS)
+        .background(Color(nsColor: .controlBackgroundColor))
     }
 }

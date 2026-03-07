@@ -1,5 +1,25 @@
 import Foundation
 
+// MARK: - DataDriver.swift
+//
+// Protocol and error types shared by all data driver implementations.
+//
+// ── Driver architecture ───────────────────────────────────────────────────────
+//   Each driver handles communication with one type of industrial protocol:
+//     OPCUAClientService — OPC-UA TCP (DA/UA subscriptions, certificate auth)
+//     MQTTDriver         — MQTT broker subscriptions mapped to tag names
+//     ModbusDriver       — Modbus TCP/RTU register polling
+//
+//   Drivers are owned by DataService.drivers and started/stopped together
+//   via startDataCollection() / stopDataCollection().
+//   They all conform to @MainActor DataDriver, but their internal I/O typically
+//   runs on background actors/threads and posts results back to @MainActor.
+//
+// ── DriverError.notImplemented ────────────────────────────────────────────────
+//   Thrown by drivers whose connect() is not yet fully implemented (MQTT, Modbus).
+//   DataService catches this and logs a warning instead of showing an error alert —
+//   it is a known "coming soon" state, not a runtime failure.
+
 // MARK: - Driver Types
 
 enum DriverType: String, Codable, CaseIterable {

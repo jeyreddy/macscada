@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Microphone is used for voice command input to the HMI operator interface.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Camera is used for gesture recognition to enable hands-free HMI operation.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Speech recognition converts operator voice commands into HMI control actions.</string>
+</dict>
+</plist>

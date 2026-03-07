@@ -1,3 +1,36 @@
+// MARK: - OPCUAConnectionView.swift
+//
+// OPC-UA server discovery and connection management panel, shown in the Settings tab.
+// Combines live status, diagnostics, automatic Bonjour discovery, endpoint enumeration,
+// and direct URL connection in a single scrollable form.
+//
+// ── Sections ──────────────────────────────────────────────────────────────────
+//   1. statusCard        — connection state chip (Disconnected/Connecting/Connected/Error)
+//                          + server URL badge + Disconnect button
+//   2. diagnosticsSection — OPCUADiagnostics panel: round-trip latency, poll cycle timing,
+//                           missed polls counter; refreshed every 10 s while connected
+//   3. bonjourSection    — OPCUABonjourScanner: lists all opc.tcp services found via
+//                          mDNS on the local network; "Connect" button per result
+//   4. discoverySection  — UA endpoint discovery: enter a URL → discover endpoints
+//                          (security modes, auth policies); "Connect" button per endpoint
+//   5. directConnectSection — text field for opc.tcp://host:4840 → "Connect" button
+//   6. serverInfoSection — UA server info (product name, build version) shown when connected
+//
+// ── OPCUABonjourScanner ───────────────────────────────────────────────────────
+//   @StateObject scans for _opcua-tcp._tcp.local. services via NetServiceBrowser.
+//   Each found service: hostname, port, name. "Connect" builds opc.tcp://host:port URL.
+//
+// ── OPCUADiagnostics ──────────────────────────────────────────────────────────
+//   @StateObject wraps OPCUAClientService polling metrics.
+//   Displays: average latency (ms), max latency, poll rate (Hz), missed polls.
+//   Refreshed every 10 s via an internal Timer when showDiagnostics = true.
+//
+// ── Connection Flow ───────────────────────────────────────────────────────────
+//   All connect actions call opcuaService.connect(to: url) (async/await).
+//   isConnecting and connectError drive UI feedback (progress + error label).
+//   On success, dataService.startDataCollection() is NOT called automatically —
+//   operator must use MonitorView's "Start" button.
+
 import SwiftUI
 
 // MARK: - OPCUAConnectionView

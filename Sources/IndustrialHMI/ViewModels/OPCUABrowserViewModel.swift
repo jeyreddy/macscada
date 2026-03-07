@@ -1,3 +1,47 @@
+// MARK: - OPCUABrowserViewModel.swift
+//
+// ViewModel for OPCUABrowserView — manages the OPC-UA address space tree state,
+// node browsing, search filtering, and tag creation from selected nodes.
+//
+// ── Architecture ──────────────────────────────────────────────────────────────
+//   @MainActor class — all @Published updates on main thread.
+//   OPCUABrowserView uses @StateObject to hold the VM; never recreated on tab switch
+//   (view is in MonitorView's ZStack always-alive pattern).
+//
+// ── Simulation Mode ───────────────────────────────────────────────────────────
+//   Configuration.simulationMode = true:
+//     loadSimulatedNodes() builds a virtual tree from TagEngine.tags.
+//     Subscribed to tagEngine.$tagCount to rebuild when tags added/removed.
+//     Allows browsing without a real OPC-UA server.
+//   Configuration.simulationMode = false:
+//     Subscribes to opcuaService.$connectionState → loads root on .connected.
+//     300 ms delay after connect before browse (server init settle time).
+//
+// ── Node Tree ─────────────────────────────────────────────────────────────────
+//   rootNodes: top-level browse results (Objects folder children).
+//   loadedNodes: [nodeId → [child]] browse cache (avoid re-browsing expanded nodes).
+//   flattenedNodes: depth-first flattened array for List rendering.
+//   OPCUANode.level: indent depth (0 = root). OPCUANode.isExpanded / hasChildren.
+//   toggleExpansion(_ node:):
+//     If not yet loaded: call opcuaService.browseAddressSpace(root: nodeId) → cache.
+//     Toggle node.isExpanded → rebuild flattenedNodes via flattenTree().
+//
+// ── Search ────────────────────────────────────────────────────────────────────
+//   searchText: String published; OPCUABrowserView filters flattenedNodes using
+//   case-insensitive contains on displayName or nodeId.
+//
+// ── Tag Creation ──────────────────────────────────────────────────────────────
+//   createTagFromNode(_ node:):
+//     Only for Variable nodes (node.nodeClass == .variable).
+//     name = node.displayName, nodeId = node.nodeId.
+//     dataType inferred from node.dataType (UA_NS0ID → TagDataType mapping).
+//     tagEngine.addTag(newTag) → persists + subscribes to OPC-UA.
+//     alarmManager.alarmConfigs checked: if no config yet, creates a default one.
+//
+// ── ServerConfiguration ───────────────────────────────────────────────────────
+//   Lightweight struct holding browse root nodeId, max depth, timeout.
+//   serverConfig.default = {rootNodeId: "ns=0;i=85", maxDepth: 5, timeout: 10s}
+
 import Foundation
 import Combine
 
@@ -214,43 +258,45 @@ class OPCUABrowserViewModel: ObservableObject {
     func addTagFromNode(_ node: OPCUANode) async {
         guard node.nodeClass == .variable else { return }
 
-        // Avoid duplicates
-        guard !tagEngine.getAllTags().contains(where: { $0.nodeId == node.nodeId }) else { return }
-
-        let tag = Tag(
-            name: node.displayName,
-            nodeId: node.nodeId,
-            value: .none,
-            quality: .uncertain,
-            description: node.browseName
-        )
-        tagEngine.addTag(tag)
+        // If the tag is already in TagEngine (e.g. restored from DB), don't re-add it —
+        // but DO subscribe if it isn't being polled yet (handles the "can't re-add" case).
+        let alreadyInEngine = tagEngine.getAllTags().contains(where: { $0.nodeId == node.nodeId })
+        if !alreadyInEngine {
+            let tag = Tag(
+                name: node.displayName,
+                nodeId: node.nodeId,
+                value: .none,
+                quality: .uncertain,
+                description: node.browseName
+            )
+            tagEngine.addTag(tag)
+        }
 
         // In simulation mode, TagEngine's simulation timer will drive updates — no OPC-UA sub needed.
         guard !Configuration.simulationMode else { return }
 
-        // Real mode: subscribe via OPC-UA for live updates
+        // Real mode: subscribe if not already subscribed this session.
         guard !subscribedNodeIds.contains(node.nodeId) else { return }
         subscribedNodeIds.insert(node.nodeId)
 
-        let tagName    = node.displayName
-        let tagEngine  = self.tagEngine
-        let alarmMgr   = self.alarmManager
+        // Resolve tag name from engine in case the node display name differs from stored tag name.
+        let tagName   = tagEngine.getAllTags().first(where: { $0.nodeId == node.nodeId })?.name ?? node.displayName
+        let tagEngine = self.tagEngine
+        let alarmMgr  = self.alarmManager
 
         do {
-            try await opcuaService.subscribe(to: [node.nodeId]) { [weak self] nodeId, value, quality, timestamp in
+            try await opcuaService.subscribe(to: [node.nodeId]) { [weak self] _, value, quality, timestamp in
                 Task { @MainActor in
                     tagEngine.updateTag(name: tagName, value: value, quality: quality, timestamp: timestamp)
                     if let updatedTag = tagEngine.getTag(named: tagName) {
                         alarmMgr.checkAlarms(for: updatedTag)
                     }
-                    _ = self  // retain self weakly
+                    _ = self
                 }
             }
             Logger.shared.info("Browser: subscribed \(tagName)")
         } catch {
-            // Roll back if subscription failed
-            tagEngine.removeTag(named: node.displayName)
+            if !alreadyInEngine { tagEngine.removeTag(named: node.displayName) }
             subscribedNodeIds.remove(node.nodeId)
             errorMessage = "Failed to subscribe: \(error.localizedDescription)"
         }
@@ -258,19 +304,28 @@ class OPCUABrowserViewModel: ObservableObject {
 
     // MARK: - Reconnect Recovery
 
-    /// Re-subscribe all previously-added tags after a Stop → Start cycle.
+    /// Re-subscribe all tags currently in TagEngine after a (re)connect.
+    /// This covers both tags browsed in the current session AND tags restored from the
+    /// historian DB on startup — fixing the "lost link after reconnect" bug.
     private func resubscribeTags() async {
-        guard !subscribedNodeIds.isEmpty else { return }
-        Logger.shared.info("Browser: re-subscribing \(subscribedNodeIds.count) tag(s)")
+        // All real OPC-UA tags (skip simulation nodeIds).
+        let allTags = tagEngine.getAllTags().filter {
+            !$0.nodeId.isEmpty && !$0.nodeId.hasPrefix("sim:")
+        }
+        guard !allTags.isEmpty else { return }
+        Logger.shared.info("Browser: re-subscribing \(allTags.count) tag(s) after (re)connect")
+
+        // Sync session tracking set to exactly the current live tag set.
+        subscribedNodeIds = Set(allTags.map { $0.nodeId })
 
         let tagEngine = self.tagEngine
         let alarmMgr  = self.alarmManager
 
-        for nodeId in subscribedNodeIds {
-            guard let tag = tagEngine.getAllTags().first(where: { $0.nodeId == nodeId }) else { continue }
+        for tag in allTags {
             let tagName = tag.name
+            let nodeId  = tag.nodeId
             do {
-                try await opcuaService.subscribe(to: [nodeId]) { nodeId, value, quality, timestamp in
+                try await opcuaService.subscribe(to: [nodeId]) { _, value, quality, timestamp in
                     Task { @MainActor in
                         tagEngine.updateTag(name: tagName, value: value, quality: quality, timestamp: timestamp)
                         if let updatedTag = tagEngine.getTag(named: tagName) {

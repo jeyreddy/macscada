@@ -1,3 +1,41 @@
+// MARK: - OPCUABrowserView.swift
+//
+// OPC-UA address space browser — displays the live server node tree and allows
+// operators to map OPC-UA variable nodes directly to HMI tags by double-clicking.
+//
+// ── Architecture ──────────────────────────────────────────────────────────────
+//   OPCUABrowserView wraps OPCUABrowserViewModel (@StateObject).
+//   ViewModel is initialized with opcuaService, tagEngine, alarmManager.
+//   View is instantiated in MonitorView's ZStack (permanent — avoids @StateObject reinit
+//   on tab switch which would lose browse state and reset the tree).
+//
+// ── Layout ────────────────────────────────────────────────────────────────────
+//   statusBar    — connection dot (green/red) + node count + loading spinner
+//   searchBar    — filters flattenedNodes by node display name / nodeId
+//   nodeListView — List of AddressSpaceNodeRow items (expand/collapse hierarchy)
+//   footerHint   — keyboard shortcut hints (Double-click = create tag, etc.)
+//
+// ── Node Tree ─────────────────────────────────────────────────────────────────
+//   OPCUABrowserViewModel.browse() starts from OPC-UA root (ns=0;i=85 Objects folder).
+//   Recursive browse: each Object/Variable node expanded on demand.
+//   flattenedNodes: [OPCUANode] — depth-first flattened list with indent levels.
+//   Tree expansion state tracked in viewModel.expandedNodeIds: Set<String>.
+//
+// ── Tag Creation ──────────────────────────────────────────────────────────────
+//   Double-clicking a Variable node calls viewModel.createTagFromNode(_:):
+//     1. Creates a new Tag with name = node.displayName, nodeId = node.nodeId.
+//     2. Infers dataType from OPCUANode.dataType string (UA_NS0ID mappings).
+//     3. Calls tagEngine.addTag(tag) → persisted to historian.
+//   Confirmation banner shown at top of list after successful creation.
+//
+// ── Search ────────────────────────────────────────────────────────────────────
+//   viewModel.searchText filter applied to flattenedNodes in the view computed var.
+//   Case-insensitive contains on node.displayName OR node.nodeId.
+//
+// ── AddressSpaceNodeRow ───────────────────────────────────────────────────────
+//   Per-node row: indent spacer + expand chevron + node type icon + display name
+//   + nodeId in secondary color. Disclosure group expand/collapse via viewModel.
+
 import SwiftUI
 
 struct OPCUABrowserView: View {

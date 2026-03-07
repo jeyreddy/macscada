@@ -1,3 +1,33 @@
+// MARK: - AddressSpaceNodeRow.swift
+//
+// Single row view for a node in the OPC-UA address space tree (OPCUABrowserView).
+// Renders indentation, expand/collapse toggle, node class icon, display name, and nodeId.
+//
+// ── Indentation ───────────────────────────────────────────────────────────────
+//   ForEach(0..<node.level) { _ in Spacer().frame(width: 20) }
+//   node.level is set by OPCUABrowserViewModel during tree flattening:
+//   root nodes = 0, their children = 1, grandchildren = 2, etc.
+//
+// ── Expand/Collapse Toggle ────────────────────────────────────────────────────
+//   Shown only when node.hasChildren = true.
+//   Shows chevron.right (collapsed) or chevron.down (expanded).
+//   Tapping calls onToggleExpansion() → OPCUABrowserViewModel.toggleExpansion(node).
+//   node.hasChildren is set during browse; hasChildren may be true even before
+//   children are loaded (lazy browse on first expand).
+//
+// ── Node Class Icons ──────────────────────────────────────────────────────────
+//   node.nodeClass.icon: SF Symbol from OPCUANode extension:
+//     Object   → "cube"
+//     Variable → "number"
+//     Method   → "function"
+//     ObjectType, VariableType → shape.fill variants
+//   nodeClassColor(_ class:): semantic Color per class for quick visual scanning.
+//
+// ── Double-Click Tag Creation ─────────────────────────────────────────────────
+//   OPCUABrowserView wraps rows in a gesture recognizer for double-click detection.
+//   Double-clicking a Variable node calls OPCUABrowserViewModel.createTagFromNode(_:).
+//   The footerHint in OPCUABrowserView shows "Double-click a Variable to create a tag".
+
 import SwiftUI
 
 struct AddressSpaceNodeRow: View {

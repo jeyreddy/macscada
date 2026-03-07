@@ -9,6 +9,22 @@ struct Configuration {
         get { UserDefaults.standard.string(forKey: "opcua.serverURL") ?? "" }
         set { UserDefaults.standard.set(newValue, forKey: "opcua.serverURL") }
     }
+
+    /// One-time migration: clear stale short hostnames that cannot resolve (e.g. the old "mac" name).
+    /// Valid hostnames are IPs (contain dots), "localhost", or FQDNs (contain dots).
+    /// Call this once before any service reads opcuaServerURL.
+    static func migrateServerURLIfNeeded() {
+        let stored = UserDefaults.standard.string(forKey: "opcua.serverURL") ?? ""
+        guard !stored.isEmpty else { return }
+        guard let inner = URL(string: stored.replacingOccurrences(of: "opc.tcp://", with: "http://")),
+              let host  = inner.host, !host.isEmpty else { return }
+        // A hostname without any dots (and not "localhost") is a bare NetBIOS-style name
+        // that almost certainly won't resolve after a machine rename.
+        let isUnresolvable = host != "localhost" && !host.contains(".")
+        if isUnresolvable {
+            UserDefaults.standard.removeObject(forKey: "opcua.serverURL")
+        }
+    }
     
     /// Connection timeout in seconds
     static let connectionTimeout: TimeInterval = 30.0
@@ -20,15 +36,25 @@ struct Configuration {
     static let maxSubscriptionTags = 1000
     
     // MARK: - Historian Settings
-    
+
     /// Data retention period in days
     static let historianRetentionDays = 90
-    
-    /// Batch size for historian writes
+
+    /// Maximum number of pending writes before an immediate flush (regardless of timer)
     static let historianBatchSize = 100
-    
-    /// Historian write interval in seconds
-    static let historianWriteInterval: TimeInterval = 1.0
+
+    /// Historian batch flush interval in seconds
+    static let historianWriteInterval: TimeInterval = 5.0
+
+    // MARK: - Cache / Filtering Settings
+
+    /// Analog deadband: suppress historian write + SwiftUI update when |new − last| < this value.
+    /// Set to 0.0 to disable (every sample is recorded).
+    static let analogDeadband: Double = 0.1
+
+    /// Last-Known-Good holdoff: number of *consecutive* bad/uncertain polls before the uncertain
+    /// quality is propagated to the UI and historian.  Single-poll glitches are silently ignored.
+    static let lkgHoldoffPolls: Int = 3
     
     // MARK: - Alarm Settings
     

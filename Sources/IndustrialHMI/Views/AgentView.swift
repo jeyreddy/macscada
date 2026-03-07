@@ -1,3 +1,46 @@
+// MARK: - AgentView.swift
+//
+// Dedicated full-screen chat interface for the Claude AI agent.
+// Renders the conversation history as bubble messages and provides text + image input.
+// Always alive in MainView's ZStack (opacity-hidden when not active tab).
+//
+// ── Layout ────────────────────────────────────────────────────────────────────
+//   VStack:
+//     notConnectedBanner (shown only when !agentService.hasAPIKey)
+//       — "Connect to Claude" button → shows ClaudeSignInSheet
+//     ScrollViewReader (auto-scrolls to newest message)
+//       LazyVStack: ForEach(agentService.messages) → messageBubble(msg)
+//       + TypingIndicatorRow when agentService.isLoading
+//     inputBar — TextField + image attachment + send button
+//
+// ── Message Bubbles ───────────────────────────────────────────────────────────
+//   messageBubble(_ msg: AgentMessage) dispatches on msg.kind:
+//     .user          — right-aligned blue bubble, text + optional attached image thumbnail
+//     .assistant     — left-aligned gray bubble, Markdown-rendered text
+//     .toolCall      — compact collapsible row showing tool name + arguments JSON
+//     .toolResult    — compact collapsible row showing tool result summary
+//     .error         — red banner with error message
+//   Markdown rendering via AttributedString (basic bold/italic/code; no full MD parser).
+//
+// ── Image Attachment ──────────────────────────────────────────────────────────
+//   "📎" button opens NSOpenPanel filtered to image UTTypes.
+//   Drop zone: .onDrop(of: [UTType.image, UTType.fileURL]) also accepted.
+//   Image loaded as Data → base64-encoded → attachedImageB64: String?.
+//   Sent alongside text via agentService.sendMessage(text:imageBase64:).
+//   Preview thumbnail shown in inputBar when an image is attached; "×" clears it.
+//
+// ── Auto-scroll ───────────────────────────────────────────────────────────────
+//   scrollProxy captured in .onAppear. onChange(of: messages.count) + onChange(of: isLoading)
+//   both call scrollToBottom(proxy) via proxy.scrollTo("typing" or last message id).
+//
+// ── TypingIndicatorRow ────────────────────────────────────────────────────────
+//   Animated three-dot bouncing indicator (private View) shown when isLoading.
+//   Uses withAnimation(.easeInOut(duration:0.6).repeatForever()) on dot offsets.
+//
+// ── ChatbotPanel ──────────────────────────────────────────────────────────────
+//   A compact floating panel variant of AgentView used from FloatingPanelManager.
+//   Same message list + input bar but in a smaller, non-fullscreen container.
+
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
@@ -9,14 +52,14 @@ struct AgentView: View {
 
     @State private var inputText:         String  = ""
     @State private var attachedImageB64:  String? = nil
-    @State private var apiKeyInput:       String  = ""
+    @State private var showSignIn:        Bool    = false
     @State private var scrollProxy:       ScrollViewProxy? = nil
 
     var body: some View {
         VStack(spacing: 0) {
-            // ── API Key Banner ──────────────────────────────────────────────
+            // ── Claude connection banner ────────────────────────────────────
             if !agentService.hasAPIKey {
-                apiKeyBanner
+                notConnectedBanner
                 Divider()
             }
 
@@ -58,31 +101,43 @@ struct AgentView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle("AI Agent")
+        .toolbar {
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    showSignIn = true
+                } label: {
+                    Label(agentService.hasAPIKey ? "Claude Connected" : "Connect to Claude",
+                          systemImage: agentService.hasAPIKey ? "checkmark.seal.fill" : "key.fill")
+                        .foregroundColor(agentService.hasAPIKey ? .green : .yellow)
+                }
+                .help(agentService.hasAPIKey ? "Manage API key" : "Connect to Claude")
+            }
+        }
+        .sheet(isPresented: $showSignIn) {
+            ClaudeSignInSheet()
+        }
     }
 
-    // MARK: - API Key Banner
+    // MARK: - Not-connected banner
 
-    private var apiKeyBanner: some View {
+    private var notConnectedBanner: some View {
         HStack(spacing: 10) {
-            Image(systemName: "key.fill")
+            Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundColor(.yellow)
-            Text("Enter your Anthropic API key to start:")
+            Text("Not connected to Claude.")
                 .font(.caption)
                 .foregroundColor(.secondary)
-            SecureField("sk-ant-...", text: $apiKeyInput)
-                .textFieldStyle(.roundedBorder)
-                .frame(maxWidth: 300)
-            Button("Save") {
-                agentService.saveAPIKey(apiKeyInput)
-                apiKeyInput = ""
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(apiKeyInput.isEmpty)
+            Button("Connect…") { showSignIn = true }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
             Spacer()
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .background(Color.yellow.opacity(0.1))
+        .sheet(isPresented: $showSignIn) {
+            ClaudeSignInSheet()
+        }
     }
 
     // MARK: - Message Bubbles

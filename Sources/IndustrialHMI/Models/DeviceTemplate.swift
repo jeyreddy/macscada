@@ -1,3 +1,36 @@
+// MARK: - DeviceTemplate.swift
+//
+// Protocol and supporting models for reusable device configuration templates.
+// A DeviceTemplate bundles all the configuration needed for a specific type
+// of industrial equipment into a single reusable unit.
+//
+// ── What is a DeviceTemplate? ─────────────────────────────────────────────────
+//   A template captures the "shape" of a device: which tags it has, what alarms
+//   it needs, and how its control logic works. Engineers instantiate a template
+//   to quickly configure a new piece of equipment without manually adding each
+//   tag and alarm from scratch.
+//   Example: "Centrifugal Pump" template might define:
+//     - Tags: LEVEL_PV (analog), RUN_STATUS (digital), FAULT (digital)
+//     - Alarms: LEVEL_HH, LEVEL_LL, FAULT active
+//     - Control logic: if RUN_STATUS && LEVEL_PV < 10 → set FAULT = true
+//
+// ── TagDefinition ─────────────────────────────────────────────────────────────
+//   Defines a tag belonging to a device (localName within the device,
+//   optional OPC-UA nodeId for instantiation, dataType, unit, description).
+//   isInput = true for process values read from the field.
+//   isInput = false for output setpoints written to the field.
+//
+// ── Control Logic ─────────────────────────────────────────────────────────────
+//   executeControlLogic(tags:) → [String: TagValue]
+//   Called by TagEngine each scan cycle for templates with logic rules.
+//   Returns a dict of tagName → new computed value for any derived/output tags.
+//   Note: this is the extensibility hook for future PLC-style ladder logic.
+//
+// ── Current Usage ─────────────────────────────────────────────────────────────
+//   DeviceTemplate is defined but not yet wired to a creation UI.
+//   Future: DeviceTemplateLibrary view would list built-in templates;
+//   instantiate() would add all defined tags + alarm configs to the system.
+
 import Foundation
 import SwiftUI
 

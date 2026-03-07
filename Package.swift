@@ -27,11 +27,19 @@ let package = Package(
                 "COPC"
             ],
             path: "Sources/IndustrialHMI",
+            exclude: ["Resources"],
             swiftSettings: [
                 .unsafeFlags(["-I/opt/homebrew/include"])
             ],
             linkerSettings: [
-                .unsafeFlags(["-L/opt/homebrew/lib", "-lopen62541"])
+                .unsafeFlags([
+                    "-L/opt/homebrew/lib",
+                    "-lopen62541",
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Sources/IndustrialHMI/Resources/Info.plist"
+                ])
             ]
         ),
         .testTarget(

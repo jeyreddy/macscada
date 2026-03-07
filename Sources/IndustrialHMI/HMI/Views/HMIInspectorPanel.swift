@@ -1,3 +1,37 @@
+// MARK: - HMIInspectorPanel.swift
+//
+// Right-side property editor for the HMI 2D canvas. Visible only in edit mode.
+// Rendered as a vertical ScrollView panel overlaid on HMICanvasView's right edge.
+//
+// ── Sections ──────────────────────────────────────────────────────────────────
+//   objectSection  — object type label, designer label
+//   geometrySection — x, y, width, height (canvas units), rotation (degrees), zIndex
+//   styleSection    — fill color, stroke color, stroke width, corner radius, opacity
+//   textSection     — font size, font weight, alignment, display format string
+//   industrialSection — P&ID-specific: pipe color, flow indicator on/off, animate running
+//   tagBindingSection — tag name binding + read-only: dataType, units, last value
+//   actionsSection  — write value (button tap), delete object, z-order (bring forward/send back)
+//
+// ── Binding Pattern ───────────────────────────────────────────────────────────
+//   binding(_:_:) helper returns a Binding<T> that reads from the live HMIObject
+//   in hmiScreenStore.screen.objects and writes via hmiScreenStore.updateObject().
+//   This ensures every field change immediately persists and re-renders the canvas.
+//
+// ── P&ID Industrial Section ───────────────────────────────────────────────────
+//   Only shown for objects where obj.type.category == "P&ID".
+//   Contains: pipe color picker (tintColor), flow direction toggle,
+//   "Animate Running" toggle (isRunning from liveValue >= writeOnValue).
+//
+// ── Tag Binding ───────────────────────────────────────────────────────────────
+//   tagBindingSection shows a text field for the tag name.
+//   Tag metadata (dataType, units) is looked up live from tagEngine.getTag(named:).
+//   Provides a searchable tag picker if the operator wants to browse available tags.
+//
+// ── Z-Order Controls ──────────────────────────────────────────────────────────
+//   "Bring Forward": increments zIndex by 1 (swaps with next-higher object if adjacent).
+//   "Send Back": decrements zIndex by 1 (swaps with next-lower object if adjacent).
+//   Implemented by comparing zIndex values in the sorted objects array.
+
 import SwiftUI
 
 // MARK: - HMIInspectorPanel
@@ -26,6 +60,10 @@ struct HMIInspectorPanel: View {
                         styleSection(obj)
                         Divider()
                         textSection(obj)
+                        if obj.type.category == "P&ID" {
+                            Divider()
+                            industrialSection(obj)
+                        }
                         Divider()
                         tagBindingSection(obj)
                         Divider()
@@ -112,11 +150,15 @@ struct HMIInspectorPanel: View {
         // Rectangle and ellipse also support a built-in text overlay
         let showStaticText = (obj.type == .textLabel
                               || obj.type == .rectangle
-                              || obj.type == .ellipse)
-        let showFormat     = (obj.type == .numericDisplay)
+                              || obj.type == .ellipse
+                              || obj.type == .pushButton)
+        let showFormat     = (obj.type == .numericDisplay || obj.type == .circularGauge)
         let showBar        = (obj.type == .levelBar)
+        let showGauge      = (obj.type == .circularGauge)
+        let showButton     = (obj.type == .pushButton || obj.type == .toggleSwitch)
+        let showSpark      = (obj.type == .trendSparkline)
 
-        if showStaticText || showFormat || showBar {
+        if showStaticText || showFormat || showBar || showGauge || showButton || showSpark {
             InspectorSection(title: "Content") {
                 if showStaticText {
                     InspectorRow(label: "Text") {
@@ -146,15 +188,71 @@ struct HMIInspectorPanel: View {
                         NumberField(value: binding(obj, \.barMax), format: "%.1f")
                     }
                 }
-                // Common text style
-                InspectorRow(label: "Font Size") {
-                    NumberField(value: binding(obj, \.fontSize), format: "%.0f")
+
+                // ── Circular Gauge ─────────────────────────────────────────
+                if showGauge {
+                    InspectorRow(label: "Gauge Min") {
+                        NumberField(value: binding(obj, \.gaugeMin), format: "%.1f")
+                    }
+                    InspectorRow(label: "Gauge Max") {
+                        NumberField(value: binding(obj, \.gaugeMax), format: "%.1f")
+                    }
+                    InspectorRow(label: "Sweep°") {
+                        HStack {
+                            Slider(value: binding(obj, \.gaugeSweepDegrees), in: 90...330)
+                            Text(String(format: "%.0f°", obj.gaugeSweepDegrees))
+                                .font(.caption)
+                                .frame(width: 38, alignment: .trailing)
+                        }
+                    }
                 }
-                InspectorRow(label: "Bold") {
-                    Toggle("", isOn: binding(obj, \.fontBold)).labelsHidden()
+
+                // ── Button / Toggle write values ───────────────────────────
+                if showButton {
+                    if obj.type == .toggleSwitch {
+                        InspectorRow(label: "ON val") {
+                            NumberField(value: binding(obj, \.writeOnValue), format: "%.2f")
+                        }
+                        InspectorRow(label: "OFF val") {
+                            NumberField(value: binding(obj, \.writeOffValue), format: "%.2f")
+                        }
+                    } else {
+                        InspectorRow(label: "Write val") {
+                            NumberField(value: binding(obj, \.writeOnValue), format: "%.2f")
+                        }
+                    }
                 }
-                InspectorRow(label: "Text Color") {
-                    ColorPicker("", selection: colorBinding(obj, \.textColor)).labelsHidden()
+
+                // ── Sparkline ──────────────────────────────────────────────
+                if showSpark {
+                    InspectorRow(label: "History") {
+                        HStack {
+                            Slider(value: Binding(
+                                get: { Double(obj.sparklineMinutes) },
+                                set: { var u = obj; u.sparklineMinutes = max(1, Int($0))
+                                       hmiScreenStore.updateObject(u) }
+                            ), in: 5...120, step: 5)
+                            Text("\(obj.sparklineMinutes) min")
+                                .font(.caption)
+                                .frame(width: 48, alignment: .trailing)
+                        }
+                    }
+                    InspectorRow(label: "Fill") {
+                        Toggle("", isOn: binding(obj, \.sparklineShowFill)).labelsHidden()
+                    }
+                }
+
+                // Common text style (not shown for toggle or sparkline)
+                if !showSpark {
+                    InspectorRow(label: "Font Size") {
+                        NumberField(value: binding(obj, \.fontSize), format: "%.0f")
+                    }
+                    InspectorRow(label: "Bold") {
+                        Toggle("", isOn: binding(obj, \.fontBold)).labelsHidden()
+                    }
+                    InspectorRow(label: "Text Color") {
+                        ColorPicker("", selection: colorBinding(obj, \.textColor)).labelsHidden()
+                    }
                 }
             }
         }
@@ -242,6 +340,55 @@ struct HMIInspectorPanel: View {
                     .foregroundColor(.red.opacity(0.7))
             }
             .buttonStyle(.plain)
+        }
+    }
+
+    // MARK: - Industrial / P&ID section (Phase 16)
+
+    @ViewBuilder
+    private func industrialSection(_ obj: HMIObject) -> some View {
+        InspectorSection(title: "P&ID Properties") {
+            // Flow direction — shown for pumps and pipes
+            if obj.type == .centrifugalPump || obj.type == .motorDrive
+                || obj.type == .pipeStraight {
+                InspectorRow(label: "Flow Dir") {
+                    Picker("", selection: binding(obj, \.flowDirection)) {
+                        ForEach(HMIFlowDirection.allCases, id: \.self) { dir in
+                            Text(dir.rawValue.capitalized).tag(dir)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: .infinity)
+                }
+            }
+
+            // Equipment variant (free-text tag subtype)
+            InspectorRow(label: "Variant") {
+                TextField("e.g. NPS4", text: binding(obj, \.equipmentVariant))
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            // Show ISA tag label inside symbol
+            InspectorRow(label: "ISA Tag") {
+                Toggle("", isOn: binding(obj, \.showISATag)).labelsHidden()
+            }
+
+            // Animate when running
+            if obj.type == .centrifugalPump || obj.type == .motorDrive
+                || obj.type == .openTank    || obj.type == .pipeStraight {
+                InspectorRow(label: "Animate") {
+                    Toggle("", isOn: binding(obj, \.animateRunning)).labelsHidden()
+                }
+            }
+
+            // Pipe chevron count
+            if obj.type == .pipeStraight {
+                InspectorRow(label: "Segments") {
+                    Stepper("\(obj.pipeSegmentCount)",
+                            value: binding(obj, \.pipeSegmentCount),
+                            in: 1...10)
+                }
+            }
         }
     }
 

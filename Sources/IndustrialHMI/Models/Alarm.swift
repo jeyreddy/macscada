@@ -1,9 +1,57 @@
 import Foundation
 
-/// Represents an alarm condition in the industrial control system
+// MARK: - Alarm.swift
+//
+// Data models for the ISA-18.2 alarm management system.
+//
+// ── ISA-18.2 state machine ────────────────────────────────────────────────────
+//
+//   Process value crosses threshold
+//           ↓
+//   AlarmState.unacknowledgedActive    ← operator must press Ack
+//        │                   │
+//   acknowledge()       returnToNormal()
+//        ↓                   ↓
+//   .acknowledgedActive  .unacknowledgedRTN   ← still needs Ack even though RTN
+//        │                   │
+//   returnToNormal()    acknowledge()
+//        ↓                   ↓
+//        └────────────► .normal              ← leaves active list
+//
+//   Additional states:
+//     .shelved      — operator temporarily suppressed (optional auto-unshelve time)
+//     .outOfService — maintenance mode (AlarmConfig.outOfService = true)
+//     .suppressed   — disabled by config (AlarmConfig.enabled = false)
+//
+// ── AlarmConfig vs Alarm ──────────────────────────────────────────────────────
+//   AlarmConfig — static setpoint definition (stored in ConfigDatabase):
+//     • tagName, highHigh/high/low/lowLow thresholds, deadband, priority
+//     • checkViolation(value:) → determines if an active alarm should fire
+//     • checkRTNCleared(value:) → determines when an alarm can return to normal
+//
+//   Alarm — a live alarm instance (held in AlarmManager.activeAlarms):
+//     • Created by AlarmManager when checkViolation returns true
+//     • Carries the trigger value, timestamps, and current state
+//     • Mutated via acknowledge() / returnToNormal() / shelve() / unshelve()
+//
+// ── Deadband (hysteresis) ────────────────────────────────────────────────────
+//   AlarmConfig.deadband prevents "alarm chattering" — repeated trigger/clear
+//   when a process value oscillates near the threshold boundary.
+//   For a high alarm at 90 % with deadband 1 %:
+//     • Alarm fires when PV ≥ 90 %
+//     • RTN fires when PV < 89 % (90 - 1)
+//   checkRTNCleared(value:) applies this hysteresis for each threshold.
+//
+// ── Audit trail ───────────────────────────────────────────────────────────────
+//   AlarmJournalEntry records every state transition (ack, RTN, shelve, unshelve)
+//   with the operator username, timestamp, and optional reason.
+//   These are written to the SQLite `alarm_journal` table for regulatory compliance.
+
+/// Represents an active alarm condition in the industrial control system.
+/// Follows the ISA-18.2 alarm management lifecycle (active → acked → RTN → normal).
 struct Alarm: Identifiable, Codable {
     // MARK: - Properties
-    
+
     let id: UUID
     var tagName: String
     var message: String
@@ -13,10 +61,16 @@ struct Alarm: Identifiable, Codable {
     var acknowledgedTime: Date?
     var acknowledgedBy: String?
     var returnToNormalTime: Date?
-    var value: Double?  // Value that triggered the alarm
-    
+    var value: Double?              // Process value at trigger time
+
+    // ISA-18.2 Shelving fields
+    var shelvedBy: String?
+    var shelvedAt: Date?
+    var shelvedUntil: Date?         // nil = shelved indefinitely
+    var shelveReason: String?
+
     // MARK: - Initialization
-    
+
     init(
         id: UUID = UUID(),
         tagName: String,
@@ -61,6 +115,24 @@ struct Alarm: Identifiable, Codable {
         default: break
         }
     }
+
+    /// Operator shelves the alarm — temporarily suppressed until `until` (or indefinitely).
+    mutating func shelve(by username: String, until: Date? = nil, reason: String? = nil) {
+        shelvedBy    = username
+        shelvedAt    = Date()
+        shelvedUntil = until
+        shelveReason = reason
+        state        = .shelved
+    }
+
+    /// Clear shelve metadata when the alarm is returned to service.
+    mutating func unshelve() {
+        shelvedBy    = nil
+        shelvedAt    = nil
+        shelvedUntil = nil
+        shelveReason = nil
+        // AlarmManager sets the new state based on current process value.
+    }
 }
 
 // MARK: - Alarm Configuration
@@ -69,17 +141,23 @@ struct Alarm: Identifiable, Codable {
 struct AlarmConfig: Codable, Identifiable {
     let id: UUID
     var tagName: String
-    
+
     // Threshold values (nil = disabled)
-    var highHigh: Double?    // Critical high alarm
-    var high: Double?        // Warning high alarm
-    var low: Double?         // Warning low alarm
-    var lowLow: Double?      // Critical low alarm
-    
+    var highHigh: Double?    // Critical high alarm (ISA: HIHI)
+    var high: Double?        // Warning high alarm  (ISA: HI)
+    var low: Double?         // Warning low alarm   (ISA: LO)
+    var lowLow: Double?      // Critical low alarm  (ISA: LOLO)
+
     var priority: AlarmPriority
-    var deadband: Double     // Hysteresis to prevent alarm flapping
+    /// Hysteresis band applied to RTN transition to prevent alarm chattering.
+    var deadband: Double
     var enabled: Bool
-    
+
+    // ISA-18.2: Out-of-Service (maintenance mode)
+    var outOfService: Bool = false
+    var outOfServiceBy: String?
+    var outOfServiceReason: String?
+
     init(
         id: UUID = UUID(),
         tagName: String,
@@ -89,7 +167,10 @@ struct AlarmConfig: Codable, Identifiable {
         lowLow: Double? = nil,
         priority: AlarmPriority = .medium,
         deadband: Double = 0.5,
-        enabled: Bool = true
+        enabled: Bool = true,
+        outOfService: Bool = false,
+        outOfServiceBy: String? = nil,
+        outOfServiceReason: String? = nil
     ) {
         self.id = id
         self.tagName = tagName
@@ -100,27 +181,42 @@ struct AlarmConfig: Codable, Identifiable {
         self.priority = priority
         self.deadband = deadband
         self.enabled = enabled
+        self.outOfService = outOfService
+        self.outOfServiceBy = outOfServiceBy
+        self.outOfServiceReason = outOfServiceReason
     }
-    
-    /// Check if value violates any threshold
+
+    /// Check if value violates any threshold. Returns the highest-priority active condition.
     func checkViolation(value: Double) -> (violated: Bool, severity: AlarmSeverity?, message: String?) {
-        guard enabled else { return (false, nil, nil) }
-        
-        // Check in order of severity
+        guard enabled, !outOfService else { return (false, nil, nil) }
+
         if let hh = highHigh, value >= hh {
-            return (true, .critical, "High-High alarm: \(value) >= \(hh)")
+            return (true, .critical, "High-High: \(String(format: "%.2f", value)) ≥ \(String(format: "%.2f", hh))")
         }
         if let h = high, value >= h {
-            return (true, .warning, "High alarm: \(value) >= \(h)")
+            return (true, .warning,  "High: \(String(format: "%.2f", value)) ≥ \(String(format: "%.2f", h))")
         }
         if let ll = lowLow, value <= ll {
-            return (true, .critical, "Low-Low alarm: \(value) <= \(ll)")
+            return (true, .critical, "Low-Low: \(String(format: "%.2f", value)) ≤ \(String(format: "%.2f", ll))")
         }
         if let l = low, value <= l {
-            return (true, .warning, "Low alarm: \(value) <= \(l)")
+            return (true, .warning,  "Low: \(String(format: "%.2f", value)) ≤ \(String(format: "%.2f", l))")
         }
-        
+
         return (false, nil, nil)
+    }
+
+    /// True when the process value has cleared **all** thresholds with the deadband
+    /// hysteresis applied — prevents chattering when PV oscillates near a setpoint.
+    ///
+    /// For high thresholds: clears when value drops below `threshold - deadband`.
+    /// For low  thresholds: clears when value rises above `threshold + deadband`.
+    func checkRTNCleared(value: Double) -> Bool {
+        if let hh = highHigh, value >= hh - deadband { return false }
+        if let h  = high,     value >= h  - deadband { return false }
+        if let ll = lowLow,   value <= ll + deadband { return false }
+        if let l  = low,      value <= l  + deadband { return false }
+        return true
     }
 }
 
@@ -163,7 +259,12 @@ enum AlarmState: String, Codable {
     case unacknowledgedRTN    = "Unack RTN"
     /// Fully resolved — in history only, not shown in active list.
     case normal               = "Normal"
+    /// Suppressed by design at config level (AlarmConfig.enabled = false).
     case suppressed           = "Suppressed"
+    /// ISA-18.2: Temporarily shelved by operator with optional auto-unshelve timeout.
+    case shelved              = "Shelved"
+    /// ISA-18.2: Alarm point taken out of service for maintenance.
+    case outOfService         = "Out of Service"
 
     /// True when the operator still needs to press Ack.
     var requiresAction: Bool {
@@ -175,9 +276,55 @@ enum AlarmState: String, Codable {
         self == .unacknowledgedActive || self == .acknowledgedActive
     }
 
-    /// True when this alarm should appear in the active alarm list.
+    /// True when this alarm should appear in the active alarm list (not shelved, not resolved).
     var isVisible: Bool {
-        self != .normal && self != .suppressed
+        self != .normal && self != .suppressed && self != .shelved && self != .outOfService
+    }
+}
+
+// MARK: - Alarm Journal Entry  (ISA-18.2 audit trail)
+
+/// Immutable record of a single ISA-18.2 alarm state transition.
+/// Written to `alarm_journal` on every acknowledge / RTN / shelve / unshelve event.
+struct AlarmJournalEntry: Identifiable, Codable {
+    let id:        UUID
+    let alarmId:   UUID
+    let tagName:   String
+    let prevState: AlarmState
+    let newState:  AlarmState
+    let changedBy: String
+    let reason:    String?
+    let timestamp: Date
+
+    init(
+        alarmId:   UUID,
+        tagName:   String,
+        prevState: AlarmState,
+        newState:  AlarmState,
+        changedBy: String,
+        reason:    String? = nil
+    ) {
+        self.id        = UUID()
+        self.alarmId   = alarmId
+        self.tagName   = tagName
+        self.prevState = prevState
+        self.newState  = newState
+        self.changedBy = changedBy
+        self.reason    = reason
+        self.timestamp = Date()
+    }
+
+    /// Init used when loading records from the database with an explicit stored timestamp.
+    init(id: UUID, alarmId: UUID, tagName: String, prevState: AlarmState, newState: AlarmState,
+         changedBy: String, reason: String?, timestamp: Date) {
+        self.id        = id
+        self.alarmId   = alarmId
+        self.tagName   = tagName
+        self.prevState = prevState
+        self.newState  = newState
+        self.changedBy = changedBy
+        self.reason    = reason
+        self.timestamp = timestamp
     }
 }
 

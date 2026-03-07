@@ -1,3 +1,46 @@
+// MARK: - HMIObjectView.swift
+//
+// Renders a single HMIObject on the canvas in either edit mode or run mode.
+// Acts as a thin dispatcher — routes to the appropriate shape/symbol renderer
+// based on HMIObject.objectType, then applies common decoration (alarm flash,
+// selection handles, rotation).
+//
+// ── Object Shape Rendering ────────────────────────────────────────────────────
+//   objectShape computes the visual based on objectType:
+//     .rectangle / .ellipse / .label / .button / .indicator / .bargraph /
+//     .trendSparkline / .image → basic SwiftUI shapes + text + sparkline overlay
+//     .motorSymbol / .pumpSymbol / .valveSymbol / .tankSymbol / .heatExchangerSymbol /
+//     .filterSymbol / .fanSymbol / .pipeStraight / .pipeElbow / .pipeTee /
+//     .sensorSymbol → IndustrialSymbolCanvas (P&ID SVG-style renderer)
+//
+// ── Edit Mode ─────────────────────────────────────────────────────────────────
+//   selectionHandles: 8 resize handles (corners + midpoints) as small blue squares.
+//   DragGesture on handles calls onResizeHandle(handle, delta) → HMICanvasView
+//   calls applyResize() which adjusts x, y, width, height while keeping the
+//   opposite corner/edge anchored.
+//   DragGesture on the object body calls onDrag(translation) → updates x/y.
+//
+// ── Run Mode ──────────────────────────────────────────────────────────────────
+//   liveTag provides the current TagValue. DisplayValue computed:
+//     .analog: formatted with displayFormat (printf-style) + unit string
+//     .digital: displayOnText / displayOffText mapped to Bool
+//     .string: raw string value
+//   onWrite callback: push button (objectType == .button) calls onWrite when tapped.
+//
+// ── Alarm Flash ───────────────────────────────────────────────────────────────
+//   alarmIndicator: red/orange flashing border rendered via .overlay + .opacity animation.
+//   alarmOpacity 1.0 → 0.3 repeating easeInOut 0.6 s when hasActiveAlarm = true.
+//   Animation stopped when hasActiveAlarm = false (alarmOpacity reset to 1.0).
+//
+// ── P&ID Running Animation ───────────────────────────────────────────────────
+//   isRunning: true when liveTag.numericValue >= object.writeOnValue AND
+//   object.animateRunning is true. Passed to IndustrialSymbolCanvas to drive
+//   rotation animation for pump/motor symbols.
+//
+// ── HandlePosition ────────────────────────────────────────────────────────────
+//   8 positions: topLeft, top, topRight, left, right, bottomLeft, bottom, bottomRight.
+//   Each handle's anchor point determines which object edges are resized.
+
 import SwiftUI
 
 // MARK: - Handle Position
@@ -18,13 +61,19 @@ struct HMIObjectView: View {
     let isEditMode: Bool
     let liveTag: Tag?            // nil in edit mode; supplies live value in run mode
     let hasActiveAlarm: Bool     // true → draw flashing alarm outline in run mode
+    var sparklinePoints: [Double] = []          // pre-fetched history for trendSparkline
 
     var onSelect: () -> Void
     var onDrag: (CGSize) -> Void                              // display-coord delta
     var onResizeHandle: (HandlePosition, CGSize) -> Void
+    var onWrite: ((String, Double) -> Void)? = nil            // run-mode write callback
 
     // Flashing alarm animation state
     @State private var alarmOpacity: Double = 1.0
+    // Push-button press visual state
+    @State private var isPressed: Bool = false
+    // P&ID running state (true when tag value >= writeOnValue)
+    @State private var isRunning: Bool = false
 
     var body: some View {
         ZStack {
@@ -34,14 +83,26 @@ struct HMIObjectView: View {
         }
         .frame(width: object.width  * scale,
                height: object.height * scale)
+        .contentShape(Rectangle())          // ensure full bounding box is tappable (Canvas / P&ID symbols)
         .rotationEffect(.degrees(object.rotation))
         .gesture(
             DragGesture(minimumDistance: 2)
                 .onEnded { value in onDrag(value.translation) }
         )
         .onTapGesture { onSelect() }
-        .onAppear   { updateFlash(hasActiveAlarm) }
+        .onAppear {
+            updateFlash(hasActiveAlarm)
+            updateRunning(liveTagDoubleValue)
+        }
         .onChange(of: hasActiveAlarm) { _, v in updateFlash(v) }
+        .onChange(of: liveTagDoubleValue) { _, v in updateRunning(v) }
+    }
+
+    // MARK: - Running state (P&ID animation driver)
+
+    private func updateRunning(_ value: Double?) {
+        guard object.animateRunning else { isRunning = false; return }
+        isRunning = (value ?? 0) >= object.writeOnValue
     }
 
     // MARK: - Flash
@@ -146,6 +207,30 @@ struct HMIObjectView: View {
 
         case .levelBar:
             levelBarView
+
+        case .circularGauge:
+            circularGaugeView
+
+        case .pushButton:
+            pushButtonView
+
+        case .toggleSwitch:
+            toggleSwitchView
+
+        case .trendSparkline:
+            trendSparklineView
+
+        // P&ID Industrial symbols (Phase 16) — delegate to IndustrialSymbolCanvas
+        case .centrifugalPump, .motorDrive, .gateValve, .globeValve,
+             .ballValve, .checkValve, .controlValve, .closedVessel,
+             .openTank, .pipeStraight, .instrumentBubble, .heatExchangerSym:
+            IndustrialSymbolCanvas.view(
+                for:        object,
+                scale:      scale,
+                liveValue:  liveTagDoubleValue,
+                isRunning:  isRunning,
+                isEditMode: isEditMode
+            )
         }
     }
 
@@ -227,6 +312,234 @@ struct HMIObjectView: View {
                         Spacer()
                     }
                 }
+            }
+        }
+    }
+
+    // MARK: - Circular Gauge
+
+    @ViewBuilder
+    private var circularGaugeView: some View {
+        let fill   = resolvedFillColor
+        let stroke = object.strokeColor.color
+        let sweep  = object.gaugeSweepDegrees
+        // fraction of the gauge range filled by the current value
+        let fraction: Double = {
+            guard let d = liveTagDoubleValue else { return isEditMode ? 0.55 : 0 }
+            let range = object.gaugeMax - object.gaugeMin
+            guard range > 0 else { return 0 }
+            return min(max((d - object.gaugeMin) / range, 0), 1)
+        }()
+
+        ZStack {
+            Canvas { ctx, size in
+                let cx = size.width  / 2
+                let cy = size.height / 2
+                let r  = min(cx, cy) * 0.78
+                // Arc convention: 0° = 3-o'clock; we want bottom-left to bottom-right.
+                // Start angle: 90° + (180° - sweep/2)  = 90 + 90 - sweep/2 = 180 - sweep/2 + 90
+                // Simplified: start = -(90 + sweep/2) in standard SwiftUI .degrees
+                let startAngle = Angle.degrees(90 + (180 - sweep) / 2)
+                let endAngle   = Angle.degrees(90 + (180 - sweep) / 2 + sweep)
+
+                // Track arc (dimmed)
+                var trackPath = Path()
+                trackPath.addArc(center: CGPoint(x: cx, y: cy),
+                                 radius: r,
+                                 startAngle: startAngle,
+                                 endAngle: endAngle,
+                                 clockwise: false)
+                ctx.stroke(trackPath,
+                           with: .color(fill.opacity(0.25)),
+                           style: StrokeStyle(lineWidth: 10 * min(size.width, size.height) / 160,
+                                             lineCap: .round))
+
+                // Value arc (filled)
+                let fillEnd = Angle.degrees(startAngle.degrees + sweep * fraction)
+                var fillPath = Path()
+                fillPath.addArc(center: CGPoint(x: cx, y: cy),
+                                radius: r,
+                                startAngle: startAngle,
+                                endAngle: fillEnd,
+                                clockwise: false)
+                ctx.stroke(fillPath,
+                           with: .color(fill),
+                           style: StrokeStyle(lineWidth: 10 * min(size.width, size.height) / 160,
+                                             lineCap: .round))
+
+                // Needle
+                let needleAngle = startAngle.radians + (endAngle.radians - startAngle.radians) * fraction
+                let nx = cx + r * 0.72 * cos(needleAngle)
+                let ny = cy + r * 0.72 * sin(needleAngle)
+                var needle = Path()
+                needle.move(to: CGPoint(x: cx, y: cy))
+                needle.addLine(to: CGPoint(x: nx, y: ny))
+                ctx.stroke(needle, with: .color(stroke),
+                           style: StrokeStyle(lineWidth: 2.5 * min(size.width, size.height) / 160,
+                                             lineCap: .round))
+
+                // Centre pivot dot
+                let dot = Path(ellipseIn: CGRect(x: cx - 4, y: cy - 4, width: 8, height: 8))
+                ctx.fill(dot, with: .color(stroke))
+            }
+
+            // Centre value label
+            VStack(spacing: 1) {
+                Text(isEditMode ? String(format: "%.1f", (object.gaugeMin + object.gaugeMax) / 2)
+                               : (liveTagDoubleValue.map { String(format: object.numberFormat, $0) } ?? "—"))
+                    .font(.system(size: object.fontSize * scale * 0.85,
+                                  weight: .semibold, design: .monospaced))
+                    .foregroundColor(object.textColor.color)
+                if !effectiveUnit.isEmpty {
+                    Text(effectiveUnit)
+                        .font(.system(size: object.fontSize * scale * 0.55))
+                        .foregroundColor(object.textColor.color.opacity(0.7))
+                }
+            }
+            .offset(y: object.height * scale * 0.12)
+        }
+    }
+
+    // MARK: - Push Button
+
+    @ViewBuilder
+    private var pushButtonView: some View {
+        let fill   = isPressed ? resolvedFillColor.opacity(0.6) : resolvedFillColor
+        let stroke = object.strokeColor.color
+        let sw     = (isPressed ? object.strokeWidth * 2 : object.strokeWidth) * scale
+
+        ZStack {
+            RoundedRectangle(cornerRadius: 8 * scale)
+                .fill(fill)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8 * scale)
+                        .strokeBorder(stroke, lineWidth: sw)
+                )
+            Text(isEditMode ? object.staticText : (object.staticText.isEmpty ? "Press" : object.staticText))
+                .font(.system(size: object.fontSize * scale,
+                              weight: object.fontBold ? .bold : .semibold))
+                .foregroundColor(object.textColor.color)
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+                .padding(4 * scale)
+        }
+        .onTapGesture {
+            guard !isEditMode, let tagName = object.tagBinding?.tagName else { return }
+            isPressed = true
+            Task {
+                try? await Task.sleep(for: .milliseconds(120))
+                isPressed = false
+            }
+            onWrite?(tagName, object.writeOnValue)
+        }
+    }
+
+    // MARK: - Toggle Switch
+
+    @ViewBuilder
+    private var toggleSwitchView: some View {
+        let isOn      = (liveTagDoubleValue ?? 0) >= (object.writeOnValue - 0.01)
+        let capsuleColor: Color = isEditMode ? object.fillColor.color
+                                             : (isOn ? .green : Color(nsColor: .systemGray))
+
+        ZStack {
+            Capsule()
+                .fill(capsuleColor.opacity(0.85))
+                .overlay(Capsule().strokeBorder(object.strokeColor.color,
+                                                lineWidth: object.strokeWidth * scale))
+
+            GeometryReader { geo in
+                let w   = geo.size.width
+                let h   = geo.size.height
+                let pad = h * 0.12
+                let dia = h - pad * 2
+                let travel = w - dia - pad * 2
+                let xPos: CGFloat = isEditMode ? w / 2 - dia / 2
+                                               : (isOn ? pad + travel : pad)
+
+                Circle()
+                    .fill(Color.white)
+                    .shadow(radius: 2 * scale)
+                    .frame(width: dia, height: dia)
+                    .offset(x: xPos, y: pad)
+                    .animation(.easeInOut(duration: 0.15), value: isOn)
+            }
+
+            // ON / OFF label
+            HStack {
+                if !isEditMode && isOn  { Spacer() }
+                Text(isEditMode ? "OFF" : (isOn ? "ON" : "OFF"))
+                    .font(.system(size: object.fontSize * scale * 0.7, weight: .bold))
+                    .foregroundColor(.white.opacity(0.9))
+                    .padding(.horizontal, 6 * scale)
+                if !isEditMode && !isOn { Spacer() }
+            }
+        }
+        .onTapGesture {
+            guard !isEditMode, let tagName = object.tagBinding?.tagName else { return }
+            let nextValue = isOn ? object.writeOffValue : object.writeOnValue
+            onWrite?(tagName, nextValue)
+        }
+    }
+
+    // MARK: - Trend Sparkline
+
+    @ViewBuilder
+    private var trendSparklineView: some View {
+        let fill   = object.fillColor.color
+        let stroke = object.strokeColor.color
+
+        ZStack {
+            // Background
+            RoundedRectangle(cornerRadius: 4 * scale)
+                .fill(fill.opacity(0.15))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 4 * scale)
+                        .strokeBorder(stroke.opacity(0.4), lineWidth: object.strokeWidth * scale)
+                )
+
+            if sparklinePoints.count >= 2 {
+                Canvas { ctx, size in
+                    let pts   = sparklinePoints
+                    let minV  = pts.min() ?? 0
+                    let maxV  = pts.max() ?? 1
+                    let range = maxV - minV
+                    let safeRange = range > 0 ? range : 1
+
+                    let inset: CGFloat = 6 * scale
+                    let drawW = size.width  - inset * 2
+                    let drawH = size.height - inset * 2
+
+                    func point(_ i: Int) -> CGPoint {
+                        let x = inset + drawW * CGFloat(i) / CGFloat(pts.count - 1)
+                        let y = inset + drawH * (1 - CGFloat((pts[i] - minV) / safeRange))
+                        return CGPoint(x: x, y: y)
+                    }
+
+                    // Line path
+                    var linePath = Path()
+                    linePath.move(to: point(0))
+                    for i in 1..<pts.count { linePath.addLine(to: point(i)) }
+
+                    // Fill area (if enabled)
+                    if object.sparklineShowFill {
+                        var fillPath = linePath
+                        fillPath.addLine(to: CGPoint(x: point(pts.count - 1).x, y: size.height - inset))
+                        fillPath.addLine(to: CGPoint(x: inset, y: size.height - inset))
+                        fillPath.closeSubpath()
+                        ctx.fill(fillPath, with: .color(stroke.opacity(0.25)))
+                    }
+
+                    ctx.stroke(linePath,
+                               with: .color(stroke),
+                               style: StrokeStyle(lineWidth: 1.5 * scale, lineCap: .round,
+                                                 lineJoin: .round))
+                }
+            } else {
+                // No data yet
+                Text(isEditMode ? "Sparkline" : "No data")
+                    .font(.system(size: object.fontSize * scale * 0.8))
+                    .foregroundColor(object.textColor.color.opacity(0.5))
             }
         }
     }

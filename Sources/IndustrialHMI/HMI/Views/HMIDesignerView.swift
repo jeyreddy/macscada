@@ -1,13 +1,55 @@
+// MARK: - HMIDesignerView.swift
+//
+// Top-level container for the "HMI Screens" tab. Always alive in MainView's ZStack
+// (opacity-hidden rather than removed) so edit state survives tab switches.
+//
+// ── Display Modes ─────────────────────────────────────────────────────────────
+//   @AppStorage("hmi.displayMode") HMIDisplayMode controls which content renders:
+//   .twoD   — traditional 2D P&ID canvas (HMICanvasView)
+//   .threeD — SceneKit 3D view (HMI3DDesignerView)
+//   .both   — HSplitView with 2D on left and 3D on right
+//   HMIDisplaySettingsView lets users switch modes.
+//
+// ── 2D Layout ─────────────────────────────────────────────────────────────────
+//   HSplitView:
+//     Left  — HMIScreenListPane (screen browser sidebar)
+//     Right — VStack:
+//               toolbarRow (Edit/Run toggle + object palette + screen settings)
+//               HMICanvasView (canvas + drag-create)
+//               HMIInspectorPanel (overlaid on right edge in edit mode)
+//
+// ── Edit / Run Mode ───────────────────────────────────────────────────────────
+//   isEditMode @State drives HMICanvasView and HMIInspectorPanel.
+//   Toggled by the toolbar Edit/Run button.
+//   On transition to run mode: selectedObjectId + activeTool cleared.
+//   faceplateObjectId drives the run-mode HMIFaceplateView popover.
+//
+// ── Object Type Palette ───────────────────────────────────────────────────────
+//   toolbarRow shows object type buttons when isEditMode = true.
+//   Tapping a button sets activeTool → HMICanvasView creates objects of that type
+//   when the user drags on the canvas background.
+//   activeTool = nil = pointer/select mode.
+//
+// ── HMIScreenListPane ─────────────────────────────────────────────────────────
+//   Left sidebar showing all screens with add/rename/delete/duplicate controls.
+//   Selecting a screen calls hmiScreenStore.setCurrentScreen(id:).
+//   CompositeHMIView (full-screen overview) is accessed via a toolbar button.
+
 import SwiftUI
 
 // MARK: - HMIDesignerView
 
 /// Top-level view for the "HMI Screens" tab.
 /// Always alive in the ZStack (like TrendView) so state is preserved across tab switches.
+/// Phase 16: supports 2D / 3D / Both display modes via @AppStorage.
 struct HMIDesignerView: View {
     @EnvironmentObject var tagEngine: TagEngine
     @EnvironmentObject var alarmManager: AlarmManager
     @EnvironmentObject var hmiScreenStore: HMIScreenStore
+    @EnvironmentObject var hmi3DSceneStore: HMI3DSceneStore
+
+    // Display mode — shared across views
+    @AppStorage("hmi.displayMode") private var displayMode: HMIDisplayMode = .twoD
 
     @State private var isEditMode: Bool = true
     @State private var activeTool: HMIObjectType? = nil   // nil = pointer / select
@@ -15,41 +57,24 @@ struct HMIDesignerView: View {
     @State private var faceplateObjectId: UUID? = nil     // run-mode tap
 
     var body: some View {
-        VStack(spacing: 0) {
-            // ── Toolbar ─────────────────────────────────────────────────────
-            toolbarRow
-            Divider()
-
-            // ── Canvas + Inspector ───────────────────────────────────────────
-            // Inspector overlays the canvas on the right only when an object
-            // is selected, so the canvas fills the full width by default.
-            ZStack(alignment: .trailing) {
-                HMICanvasView(
-                    isEditMode:        isEditMode,
-                    activeTool:        $activeTool,
-                    selectedObjectId:  $selectedObjectId,
-                    faceplateObjectId: $faceplateObjectId
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-                if isEditMode && selectedObjectId != nil {
-                    HMIInspectorPanel(selectedObjectId: $selectedObjectId)
-                        .frame(width: 280)
-                        .background(Color(nsColor: .windowBackgroundColor).opacity(0.97))
-                        .overlay(
-                            Rectangle()
-                                .frame(width: 1)
-                                .foregroundColor(Color(nsColor: .separatorColor)),
-                            alignment: .leading
-                        )
-                        .transition(.move(edge: .trailing))
+        Group {
+            switch displayMode {
+            case .twoD:
+                twoDLayout
+            case .threeD:
+                HMI3DDesignerView()
+                    .environmentObject(hmi3DSceneStore)
+                    .environmentObject(tagEngine)
+            case .both:
+                HSplitView {
+                    twoDLayout
+                        .frame(minWidth: 600)
+                    HMI3DDesignerView(showDisplayModePicker: false)
+                        .environmentObject(hmi3DSceneStore)
+                        .environmentObject(tagEngine)
+                        .frame(minWidth: 500)
                 }
             }
-            .animation(.easeInOut(duration: 0.18), value: isEditMode && selectedObjectId != nil)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            // ── Alarm Ribbon ─────────────────────────────────────────────────
-            alarmRibbon
         }
         // Faceplate popover in run mode
         .popover(item: faceplateBinding) { objId in
@@ -63,44 +88,73 @@ struct HMIDesignerView: View {
         }
     }
 
+    // MARK: - 2D Layout (extracted so it can be used in both .twoD and .both modes)
+
+    private var twoDLayout: some View {
+        HSplitView {
+            // ── Screen Sidebar ───────────────────────────────────────────────
+            HMIScreenListPane()
+                .environmentObject(hmiScreenStore)
+
+            // ── Main Content ─────────────────────────────────────────────────
+            VStack(spacing: 0) {
+                // ── Toolbar ──────────────────────────────────────────────────
+                toolbarRow
+                Divider()
+
+                // ── Canvas + Inspector ───────────────────────────────────────
+                ZStack(alignment: .trailing) {
+                    HMICanvasView(
+                        isEditMode:        isEditMode,
+                        activeTool:        $activeTool,
+                        selectedObjectId:  $selectedObjectId,
+                        faceplateObjectId: $faceplateObjectId
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                    if isEditMode && selectedObjectId != nil {
+                        HMIInspectorPanel(selectedObjectId: $selectedObjectId)
+                            .frame(width: 280)
+                            .background(Color(nsColor: .windowBackgroundColor).opacity(0.97))
+                            .overlay(
+                                Rectangle()
+                                    .frame(width: 1)
+                                    .foregroundColor(Color(nsColor: .separatorColor)),
+                                alignment: .leading
+                            )
+                            .transition(.move(edge: .trailing))
+                    }
+                }
+                .animation(.easeInOut(duration: 0.18), value: isEditMode && selectedObjectId != nil)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                // ── Alarm Ribbon ──────────────────────────────────────────────
+                alarmRibbon
+            }
+        }
+    }
+
     // MARK: - Toolbar
 
     private var toolbarRow: some View {
         HStack(spacing: 12) {
-            // ── Screen picker ────────────────────────────────────────────────
-            if !hmiScreenStore.allScreenMeta.isEmpty {
-                Picker("Screen", selection: Binding(
-                    get: { hmiScreenStore.currentScreenId ?? hmiScreenStore.allScreenMeta.first!.id },
-                    set: { hmiScreenStore.switchToScreen(id: $0) }
-                )) {
-                    ForEach(hmiScreenStore.allScreenMeta) { meta in
-                        Text(meta.name).tag(meta.id)
-                    }
-                }
-                .frame(maxWidth: 160)
-                .help("Switch screen")
-            }
+            // Current screen name label
+            Text(hmiScreenStore.screen.name)
+                .font(.caption.bold())
+                .foregroundColor(.secondary)
+                .lineLimit(1)
 
-            // Add screen
-            Button {
-                hmiScreenStore.createScreen()
-            } label: {
-                Image(systemName: "plus.rectangle")
-            }
-            .buttonStyle(.bordered)
-            .help("New screen")
+            Divider().frame(height: 22)
 
-            // Delete current screen
-            Button {
-                if let id = hmiScreenStore.currentScreenId {
-                    hmiScreenStore.deleteScreen(id: id)
+            // Display mode (2D / 3D / Both) — quick toggle without going to Settings
+            Picker("View", selection: $displayMode) {
+                ForEach(HMIDisplayMode.allCases, id: \.self) { mode in
+                    Text(mode.rawValue).tag(mode)
                 }
-            } label: {
-                Image(systemName: "trash.slash")
             }
-            .buttonStyle(.bordered)
-            .disabled(hmiScreenStore.allScreenMeta.count <= 1)
-            .help("Delete current screen")
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 130)
+            .help("Switch between 2D canvas, 3D scene, or both side-by-side")
 
             Divider().frame(height: 22)
 
@@ -115,31 +169,37 @@ struct HMIDesignerView: View {
             Divider().frame(height: 22)
 
             if isEditMode {
-                // Pointer tool
-                toolButton(icon: "cursorarrow", label: "Select", active: activeTool == nil) {
-                    activeTool = nil
-                }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 4) {
+                        // Pointer tool
+                        toolButton(icon: "cursorarrow", label: "Select", active: activeTool == nil) {
+                            activeTool = nil
+                        }
 
-                // Object type tools
-                ForEach(HMIObjectType.allCases, id: \.self) { type in
-                    toolButton(icon: type.icon, label: type.displayName, active: activeTool == type) {
-                        activeTool = (activeTool == type) ? nil : type
+                        Divider().frame(height: 22)
+
+                        // Object type tools — 21 items (9 basic + 12 P&ID), scrollable
+                        ForEach(HMIObjectType.allCases, id: \.self) { type in
+                            toolButton(icon: type.icon, label: type.displayName, active: activeTool == type) {
+                                activeTool = (activeTool == type) ? nil : type
+                            }
+                        }
+
+                        Divider().frame(height: 22)
+
+                        // Delete selected object
+                        Button {
+                            if let id = selectedObjectId {
+                                hmiScreenStore.deleteObject(id: id)
+                                selectedObjectId = nil
+                            }
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .disabled(selectedObjectId == nil)
+                        .help("Delete selected object")
                     }
                 }
-
-                Divider().frame(height: 22)
-
-                // Delete selected object
-                Button {
-                    if let id = selectedObjectId {
-                        hmiScreenStore.deleteObject(id: id)
-                        selectedObjectId = nil
-                    }
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .disabled(selectedObjectId == nil)
-                .help("Delete selected object")
             }
 
             Spacer()

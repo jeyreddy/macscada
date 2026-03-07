@@ -1,3 +1,38 @@
+// MARK: - OPCUABonjourScanner.swift
+//
+// mDNS (Bonjour) scanner for discovering OPC-UA servers on the local network.
+// OPC-UA servers register as _opcua-tcp._tcp. mDNS services per OPC-UA Part 12 §6.
+//
+// ── Compatible Servers ────────────────────────────────────────────────────────
+//   Kepware OPC Server, Prosys OPC UA Simulation Server, open62541-based servers,
+//   UA Toolkit servers, AVEVA, Rockwell FactoryTalk, Siemens OPC-UA servers.
+//   All must publish _opcua-tcp._tcp. to be discovered.
+//
+// ── Scan Lifecycle ────────────────────────────────────────────────────────────
+//   scan(timeout: 6.0):
+//     Clears servers[] + pending[]. Sets isScanning = true.
+//     Creates NetServiceBrowser, searches for _opcua-tcp._tcp. in "local.".
+//     Stops after `timeout` seconds via Timer (default 6 s).
+//   stopScan():
+//     Stops browser, resolves any remaining pending services, sets isScanning = false.
+//
+// ── NSNetServiceBrowserDelegate ───────────────────────────────────────────────
+//   browser(_:didFind:) → service.delegate = self → service.resolve(withTimeout: 5)
+//   Added to pending[] during resolution.
+//   browser(_:didRemove:) → removes from servers[] if previously resolved.
+//
+// ── NSNetServiceDelegate ──────────────────────────────────────────────────────
+//   netServiceDidResolveAddress(_:):
+//     Extracts hostname + port from NetService.
+//     Creates OPCUABonjourServer { name, host, port, url = "opc.tcp://host:port" }
+//     Appends to servers[] (deduplicates by host+port).
+//
+// ── OPCUABonjourServer ────────────────────────────────────────────────────────
+//   name: mDNS service name (e.g. "Kepware OPC Server - UA/DA")
+//   host: resolved hostname (e.g. "plc01.local" or "192.168.1.10")
+//   port: TCP port (typically 4840 or 49320)
+//   url:  computed "opc.tcp://host:port" — ready for OPCUAClientService.connect()
+
 import Foundation
 
 // MARK: - Discovered Bonjour Server

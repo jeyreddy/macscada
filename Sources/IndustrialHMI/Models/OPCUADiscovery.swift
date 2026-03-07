@@ -1,3 +1,37 @@
+// MARK: - OPCUADiscovery.swift
+//
+// Data models for OPC-UA server and endpoint discovery results.
+// Used by OPCUAConnectionView to display servers found via Bonjour scan
+// and endpoint discovery (UA_Client_getEndpoints).
+//
+// ── Discovery Flow ────────────────────────────────────────────────────────────
+//   1. Bonjour/mDNS scan → OPCUABonjourScanner → [OPCUAServerInfo]
+//      (applicationName, applicationUri, discoveryUrls from UA_ApplicationDescription)
+//   2. Endpoint discovery (explicit URL) → OPCUAClientService.discoverEndpoints()
+//      → [OPCUAEndpointInfo] (endpointUrl, serverName, securityMode, securityPolicy)
+//   OPCUAConnectionView shows both lists; operator taps "Connect" on a row.
+//
+// ── OPCUAServerInfo ───────────────────────────────────────────────────────────
+//   High-level application description from UA_findServers / Bonjour.
+//   primaryUrl: String = discoveryUrls.first — used for connection and endpoint discovery.
+//   applicationType: .server / .client / .clientAndServer / .discoveryServer / .unknown
+//   Identifiable by UUID() assigned at decode time (not a stable server UUID).
+//
+// ── OPCUAEndpointInfo ─────────────────────────────────────────────────────────
+//   Single endpoint from UA_Client_getEndpoints call.
+//   securityMode: .none / .sign / .signAndEncrypt (maps to UA_MessageSecurityMode).
+//   securityPolicy: full URI (e.g. "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256")
+//   securityPolicyName: short label after "#" for display.
+//
+// ── OPCUASecurityMode ─────────────────────────────────────────────────────────
+//   Maps UA_MessageSecurityMode enum values:
+//     0/invalid → .none (also used for "none" policy)
+//     1 → .none
+//     2 → .sign
+//     3 → .signAndEncrypt
+//   Current implementation connects with UA_MESSAGESECURITYMODE_NONE (simplest mode).
+//   Higher security modes require certificate provisioning (not yet implemented).
+
 import Foundation
 
 // MARK: - Discovered Server

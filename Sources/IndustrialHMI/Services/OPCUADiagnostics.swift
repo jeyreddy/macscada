@@ -1,3 +1,38 @@
+// MARK: - OPCUADiagnostics.swift
+//
+// Step-by-step OPC-UA connection diagnostic tool.
+// Helps engineers identify why a connection attempt to an OPC-UA server fails.
+//
+// ── Diagnostic Steps ──────────────────────────────────────────────────────────
+//   1. Parse URL        — validates opc.tcp://host:port format
+//   2. DNS Resolution   — resolves hostname via NWParameters.tcp → NWEndpoint
+//   3. TCP Reachability — attempts TCP connection to host:port (5 s timeout)
+//   4. OPC-UA Handshake — UA_Client_connect() to verify OPC-UA layer responds
+//   5. Browse Root      — UA_Client_browseSimplifiedExtensionObject (sanity check)
+//
+// ── DiagnosticStep ────────────────────────────────────────────────────────────
+//   Status: .running, .pass, .fail, .warning
+//   title: step name displayed in UI
+//   detail: technical detail (IP address, error code, latency ms)
+//   suggestion: actionable advice shown when status == .fail
+//   durationMs: wall-clock time for the step (shown in UI as "Xms")
+//
+// ── Suggested URLs ────────────────────────────────────────────────────────────
+//   suggestedURLs: [String] populated when DNS resolves to multiple IPs or
+//   when the server has multiple discoveryUrls. Shown in OPCUAConnectionView
+//   as clickable alternatives to try.
+//
+// ── run(url:) Sequence ────────────────────────────────────────────────────────
+//   Steps run sequentially — later steps are skipped if earlier ones fail.
+//   All work dispatched to background queue; @Published updates back on @MainActor.
+//   Each step records start time → computes durationMs on completion.
+//   isRunning published: OPCUAConnectionView shows a progress indicator during run.
+//
+// ── Integration ───────────────────────────────────────────────────────────────
+//   OPCUAConnectionView instantiates OPCUADiagnostics as @StateObject.
+//   "Run Diagnostics" button in diagnosticsSection calls diagnostics.run(url: diagURL).
+//   Results shown as a list of DiagnosticStep rows with status icons.
+
 import Foundation
 import Network
 import Darwin
@@ -33,7 +68,7 @@ class OPCUADiagnostics: ObservableObject {
         suggestedURLs = []
 
         // ── Step 1: Parse URL ─────────────────────────────────────────────
-        var step = DiagnosticStep(title: "Parse URL", status: .running, detail: rawURL)
+        let step = DiagnosticStep(title: "Parse URL", status: .running, detail: rawURL)
         steps.append(step)
 
         guard let parsed = parseOPCUAURL(rawURL) else {
@@ -50,7 +85,7 @@ class OPCUADiagnostics: ObservableObject {
 
         // ── Step 2: Hostname resolution ────────────────────────────────────
         let resolveStart = Date()
-        var resolveStep = DiagnosticStep(title: "Resolve Hostname", status: .running,
+        let resolveStep = DiagnosticStep(title: "Resolve Hostname", status: .running,
                                           detail: "Resolving '\(host)'…")
         steps.append(resolveStep)
 
@@ -69,7 +104,7 @@ class OPCUADiagnostics: ObservableObject {
         }
 
         // ── Step 3: TCP connectivity (localhost + resolved IPs) ────────────
-        var tcpStep = DiagnosticStep(title: "TCP Port \(port)", status: .running,
+        let tcpStep = DiagnosticStep(title: "TCP Port \(port)", status: .running,
                                       detail: "Testing TCP connectivity…")
         steps.append(tcpStep)
 
@@ -114,7 +149,7 @@ class OPCUADiagnostics: ObservableObject {
         // Try reachable addresses with UA_Client_getEndpoints
         let probeTargets: [String] = reachable.map { "opc.tcp://\($0.host):\(port)" }
 
-        var probeStep = DiagnosticStep(title: "OPC-UA Endpoint Probe", status: .running,
+        let probeStep = DiagnosticStep(title: "OPC-UA Endpoint Probe", status: .running,
                                         detail: "Querying endpoints…")
         steps.append(probeStep)
 
@@ -149,7 +184,7 @@ class OPCUADiagnostics: ObservableObject {
 
         // ── Step 5: LocalHostName hint ─────────────────────────────────────
         let localName = ProcessInfo.processInfo.hostName
-        var hintStep = DiagnosticStep(title: "This Machine", status: .pass,
+        let hintStep = DiagnosticStep(title: "This Machine", status: .pass,
                                        detail: "Hostname: \(localName)")
         steps.append(hintStep)
         let localURL = "opc.tcp://\(localName):\(port)"
@@ -201,22 +236,32 @@ class OPCUADiagnostics: ObservableObject {
         let nwHost: NWEndpoint.Host = .name(host, nil)
         let nwPort  = NWEndpoint.Port(rawValue: UInt16(port)) ?? 4840
         let conn    = NWConnection(host: nwHost, port: nwPort, using: .tcp)
-        var resumed = false
+        // Use a lock-protected flag so concurrent NW and GCD callbacks are safe.
+        final class OnceFlag: @unchecked Sendable {
+            private let lock = NSLock()
+            private var fired = false
+            func tryFire() -> Bool {
+                lock.lock(); defer { lock.unlock() }
+                guard !fired else { return false }
+                fired = true; return true
+            }
+        }
+        let flag = OnceFlag()
         return await withCheckedContinuation { cont in
             conn.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
                     conn.cancel()
-                    if !resumed { resumed = true; cont.resume(returning: true) }
+                    if flag.tryFire() { cont.resume(returning: true) }
                 case .failed, .cancelled:
-                    if !resumed { resumed = true; cont.resume(returning: false) }
+                    if flag.tryFire() { cont.resume(returning: false) }
                 default: break
                 }
             }
             conn.start(queue: .global(qos: .userInitiated))
             DispatchQueue.global().asyncAfter(deadline: .now() + 4) {
                 conn.cancel()
-                if !resumed { resumed = true; cont.resume(returning: false) }
+                if flag.tryFire() { cont.resume(returning: false) }
             }
         }
     }
@@ -264,7 +309,7 @@ class OPCUADiagnostics: ObservableObject {
         }
     }
 
-    private func uaStr(_ s: UA_String) -> String {
+    private nonisolated func uaStr(_ s: UA_String) -> String {
         guard s.length > 0, let data = s.data else { return "" }
         return String(bytes: UnsafeRawBufferPointer(start: data, count: s.length), encoding: .utf8) ?? ""
     }

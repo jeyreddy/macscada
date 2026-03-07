@@ -1,6 +1,46 @@
 import Foundation
 
-/// Represents a single process variable (tag) in the industrial control system
+// MARK: - Tag.swift
+//
+// Core data model for a single process variable (tag) — the fundamental unit of data
+// in an industrial control system.  Every piece of live data flowing through the app
+// (temperatures, pressures, valve positions, running states) is a Tag.
+//
+// ── Tag kinds ─────────────────────────────────────────────────────────────────
+//   .analog     — continuous floating-point measurement  (e.g. tank level 72.5 %)
+//   .digital    — binary on/off state                   (e.g. pump running = true)
+//   .string     — text data                             (e.g. status message)
+//   .calculated — derived value from an expression      (e.g. "({A} + {B}) / 2")
+//   .totalizer  — running accumulator                   (∑ source_value × Δt)
+//
+// ── Value type ────────────────────────────────────────────────────────────────
+//   TagValue is an enum (.analog, .digital, .string, .none).
+//   formattedValue converts it to a display string with optional engineering units.
+//   numericValue extracts a Double from analog/digital for threshold comparisons.
+//
+// ── Quality ───────────────────────────────────────────────────────────────────
+//   TagQuality mirrors OPC-UA data quality codes:
+//     .good      — data is valid and current
+//     .bad       — device offline, communication error, or data invalid
+//     .uncertain — data may be stale or from a degraded source
+//   The LKG (Last-Known-Good) holdoff in TagEngine delays propagation of bad quality
+//   for up to `Configuration.lkgHoldoffPolls` consecutive bad reads before updating.
+//   TagQuality.dot (defined in ProcessCanvasModels.swift) returns a SwiftUI Color
+//   for quality indicator dots in the canvas and inspector views.
+//
+// ── Expression syntax (calculated tags) ──────────────────────────────────────
+//   Expressions use tag name references in curly braces:
+//     "{Tank_Level}" + 10
+//     "({Inlet_Flow} - {Outlet_Flow}) * 3600"
+//   ExpressionEvaluator resolves these at each scan interval.
+//
+// ── Persistence ───────────────────────────────────────────────────────────────
+//   Tags are configured and persisted via ConfigDatabase (SQLite).
+//   Live values/quality/timestamp are held only in memory (TagEngine.tags dict).
+//   Historical values are written to Historian (SQLite) at each scan if quality ≥ good
+//   and the value change exceeds Configuration.analogDeadband.
+
+/// Represents a single process variable (tag) in the industrial control system.
 struct Tag: Identifiable, Codable, Equatable {
     // MARK: - Properties
     
@@ -30,9 +70,13 @@ struct Tag: Identifiable, Codable, Equatable {
     
     /// Tag data type for proper handling
     var dataType: TagDataType
-    
+
+    /// Expression string for calculated tags (nil for hardware/driver tags).
+    /// Example: "({Tank_Level} + {Tank2_Level}) / 2"
+    var expression: String?
+
     // MARK: - Initialization
-    
+
     init(
         id: UUID = UUID(),
         name: String,
@@ -42,7 +86,8 @@ struct Tag: Identifiable, Codable, Equatable {
         timestamp: Date = Date(),
         unit: String? = nil,
         description: String? = nil,
-        dataType: TagDataType = .analog
+        dataType: TagDataType = .analog,
+        expression: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -53,6 +98,7 @@ struct Tag: Identifiable, Codable, Equatable {
         self.unit = unit
         self.description = description
         self.dataType = dataType
+        self.expression = expression
     }
     
     // MARK: - Computed Properties
@@ -137,7 +183,8 @@ enum TagDataType: String, Codable, Equatable {
     case analog     // Continuous values (temperature, pressure, level)
     case digital    // Binary states (on/off, open/closed)
     case string     // Text data
-    case calculated // Derived/computed values
+    case calculated // Derived/computed values (formula expression)
+    case totalizer  // Running accumulator: ∑(source_value × Δt) over time
 }
 
 // MARK: - Tag Configuration

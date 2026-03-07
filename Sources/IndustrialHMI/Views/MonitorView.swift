@@ -1,3 +1,46 @@
+// MARK: - MonitorView.swift
+//
+// The primary operational screen — combines live tag monitoring, alarm configuration,
+// and OPC-UA address space browser in a single always-alive view.
+//
+// ── Layout ────────────────────────────────────────────────────────────────────
+//   VStack:
+//     statusToolbar — connection status + data collection Start/Stop + OPC-UA URL
+//                     + mic toggle button (multimodal panel) + export actions
+//     HSplitView:
+//       Left  — tagTablePane (filterable, sortable tag table)
+//       Right — rightPane (Tab-switched: Tag Detail | Alarm Limits | OPC Browser)
+//
+// ── Tag Table Pane ────────────────────────────────────────────────────────────
+//   Sortable Table<Tag> with columns: name, value, unit, quality, dataType, nodeId.
+//   searchText filters by tag name (case-insensitive contains).
+//   selectedQuality filter limits to tags with the chosen quality level.
+//   sortOrder: [KeyPathComparator] drives Table.init(sortOrder:) for client-side sort.
+//   Selecting a tag sets selectedTagId → right panel shows Tag Detail.
+//
+// ── Right Panel ───────────────────────────────────────────────────────────────
+//   .detail      — TagDetailView: name, description, value, quality badge, tag type,
+//                  expression (if calculated), nodeId, last update time, alarm status.
+//                  "View in Trends" button: sets trendTagNames/@AppStorage, switches tab.
+//                  "Write Value" button: shows WriteValueSheet (engineer+ role only).
+//   .alarmLimits — Alarm configuration for selected tag: inline AlarmConfigEditor.
+//   .browser     — OPCUABrowserView (always instantiated in ZStack — avoids ViewModel reinit).
+//
+// ── Status Toolbar ────────────────────────────────────────────────────────────
+//   Connection state icon (OPCUAClientService.connectionState).
+//   "Start" / "Stop" buttons call dataService.startDataCollection() / stopDataCollection().
+//   OPC-UA URL field (editable) bound to opcuaService.serverURL.
+//   Simulation mode badge shown when dataService.simulationMode = true.
+//
+// ── "View in Trends" Integration ──────────────────────────────────────────────
+//   trendTagNames: @AppStorage("trend.selectedTags") shared with TrendView.
+//   trendFocusedTag: @AppStorage("trend.focusedTag") shared with TrendView.
+//   Setting these + selectedTab = .trends causes TrendView to pre-select the tag.
+//
+// ── MonitorRightPanel ─────────────────────────────────────────────────────────
+//   Private enum: .detail, .alarmLimits, .browser — controls rightPane content.
+//   Segmented picker in the pane header lets the operator switch panels.
+
 import SwiftUI
 
 // MARK: - Right-panel mode
@@ -17,6 +60,7 @@ struct MonitorView: View {
     @EnvironmentObject var opcuaService:  OPCUAClientService
     @EnvironmentObject var tagEngine:     TagEngine
     @EnvironmentObject var alarmManager:  AlarmManager
+    @EnvironmentObject var sessionManager: SessionManager
 
     /// Binding to MainView's tab — allows "View in Trends" to navigate directly.
     @Binding var selectedTab: Tab
@@ -31,6 +75,9 @@ struct MonitorView: View {
     // Alarm config sheet (fallback modal for edge cases)
     @State private var alarmConfigTag:  Tag?           = nil
     @State private var showAlarmConfig: Bool           = false
+
+    // Write value sheet
+    @State private var showWriteSheet:  Bool           = false
 
     // "View in Trends" integration
     @AppStorage("trend.selectedTags")  private var trendTagNames:    String = ""
@@ -61,52 +108,60 @@ struct MonitorView: View {
                 AlarmConfigSheet(tag: tag).environmentObject(alarmManager)
             }
         }
+        .sheet(isPresented: $showWriteSheet) {
+            if let tag = selectedTag {
+                WriteValueSheet(tag: tag, operatorName: sessionManager.currentUsername)
+                    .environmentObject(dataService)
+                    .environmentObject(tagEngine)
+            }
+        }
     }
 
     // MARK: - Status Toolbar
 
     private var statusToolbar: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: HMIStyle.spacingM) {
             // Connection indicator
             HStack(spacing: 6) {
                 Circle().fill(connectionColor).frame(width: 10, height: 10)
-                Text(opcuaService.connectionState.rawValue).font(.caption.bold())
+                Text(opcuaService.connectionState.rawValue).font(HMIStyle.statusLabelFont)
             }
 
-            Divider().frame(height: 18)
+            Divider().frame(height: 20)
 
             // Tag statistics
             let ts = tagEngine.getStatistics()
-            HStack(spacing: 10) {
+            HStack(spacing: HMIStyle.spacingS) {
                 miniStat("\(ts.totalTags)", "Tags",    .primary)
-                miniStat("\(ts.goodTags)",  "Good",    .green)
-                if ts.badTags      > 0 { miniStat("\(ts.badTags)",      "Bad",  .red)    }
-                if ts.uncertainTags > 0 { miniStat("\(ts.uncertainTags)", "Unc", .yellow) }
+                miniStat("\(ts.goodTags)",  "Good",    HMIStyle.colorNormal)
+                if ts.badTags      > 0 { miniStat("\(ts.badTags)",      "Bad",  HMIStyle.colorCritical) }
+                if ts.uncertainTags > 0 { miniStat("\(ts.uncertainTags)", "Unc", HMIStyle.colorUncertain) }
             }
 
-            Divider().frame(height: 18)
+            Divider().frame(height: 20)
 
             // Alarm summary
             let as_ = alarmManager.getStatistics()
             if as_.totalActive > 0 {
-                HStack(spacing: 4) {
+                HStack(spacing: HMIStyle.spacingXS) {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(as_.critical > 0 ? .red : .orange).font(.caption)
+                        .foregroundColor(as_.critical > 0 ? HMIStyle.colorCritical : HMIStyle.colorWarning)
+                        .font(.callout)
                     Text("\(as_.totalActive) alarm\(as_.totalActive == 1 ? "" : "s")")
-                        .font(.caption.bold())
-                        .foregroundColor(as_.critical > 0 ? .red : .orange)
+                        .font(HMIStyle.statusLabelFont)
+                        .foregroundColor(as_.critical > 0 ? HMIStyle.colorCritical : HMIStyle.colorWarning)
                 }
             } else {
-                HStack(spacing: 4) {
-                    Image(systemName: "checkmark.circle.fill").foregroundColor(.green).font(.caption)
-                    Text("No Alarms").font(.caption).foregroundColor(.secondary)
+                HStack(spacing: HMIStyle.spacingXS) {
+                    Image(systemName: "checkmark.circle.fill").foregroundColor(HMIStyle.colorNormal).font(.callout)
+                    Text("No Alarms").font(HMIStyle.statusLabelFont).foregroundColor(.secondary)
                 }
             }
 
             Spacer()
 
             Text(Configuration.opcuaServerURL)
-                .font(.caption2).foregroundColor(.secondary)
+                .font(HMIStyle.statusMetaFont).foregroundColor(.secondary)
 
             // Polling toggle (OPC-UA live mode only)
             if !Configuration.simulationMode {
@@ -141,15 +196,15 @@ struct MonitorView: View {
                 .disabled(opcuaService.connectionState == .connecting)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .padding(.horizontal, HMIStyle.toolbarPaddingH)
+        .padding(.vertical, HMIStyle.toolbarPaddingV)
         .background(Color(nsColor: .controlBackgroundColor))
     }
 
     private func miniStat(_ value: String, _ label: String, _ color: Color) -> some View {
         HStack(spacing: 3) {
-            Text(value).font(.caption.bold()).foregroundColor(color)
-            Text(label).font(.caption2).foregroundColor(.secondary)
+            Text(value).font(HMIStyle.statusLabelFont).foregroundColor(color)
+            Text(label).font(HMIStyle.statusMetaFont).foregroundColor(.secondary)
         }
     }
 
@@ -170,6 +225,20 @@ struct MonitorView: View {
                 }
                 .pickerStyle(.segmented)
                 .frame(maxWidth: 180)
+
+                Spacer(minLength: 0)
+
+                Button {
+                    if let csv = try? CSVBuilder.buildTagList(tagEngine.getAllTags()) {
+                        CSVBuilder.saveToFile(csv,
+                            suggestedName: "tags_\(CSVBuilder.filenameDate()).csv")
+                    }
+                } label: {
+                    Label("Export Tags…", systemImage: "square.and.arrow.up.on.square")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Export all tags to CSV")
             }
             .padding(8)
             .background(Color(nsColor: .controlBackgroundColor))
@@ -181,10 +250,10 @@ struct MonitorView: View {
                 TableColumn("Tag Name", value: \.name) { tag in
                     HStack(spacing: 4) {
                         Text(tag.name)
-                            .font(.system(.body, design: .monospaced))
+                            .font(HMIStyle.tagNameFont)
                             .lineLimit(1)
                         if alarmManager.alarmConfigs.contains(where: { $0.tagName == tag.name }) {
-                            Image(systemName: "bell.fill").font(.caption2).foregroundColor(.orange)
+                            Image(systemName: "bell.fill").font(.caption2).foregroundColor(HMIStyle.colorWarning)
                         }
                     }
                     .contextMenu {
@@ -195,26 +264,33 @@ struct MonitorView: View {
                         Button { addToTrends(tag.name) } label: {
                             Label("View in Trends", systemImage: "chart.xyaxis.line")
                         }
+                        Divider()
+                        Button(role: .destructive) { removeTag(tag) } label: {
+                            Label("Remove Tag", systemImage: "trash")
+                        }
                     }
                 }
 
                 TableColumn("Value") { tag in
                     Text(tag.formattedValue)
-                        .font(.system(.body, design: .monospaced).bold())
+                        .font(HMIStyle.inlineValueFont)
                 }
                 .width(min: 90)
 
                 TableColumn("Quality") { tag in
                     HStack(spacing: 4) {
-                        Circle().fill(qualityColor(tag.quality)).frame(width: 7, height: 7)
-                        Text(tag.quality.description).font(.caption)
+                        Circle().fill(HMIStyle.qualityColor(tag.quality))
+                            .frame(width: HMIStyle.qualityDotSize, height: HMIStyle.qualityDotSize)
+                        Text(tag.quality.description)
+                            .font(HMIStyle.fieldLabelFont)
+                            .foregroundColor(HMIStyle.qualityColor(tag.quality))
                     }
                 }
                 .width(80)
 
                 TableColumn("Updated") { tag in
                     Text(tag.timestamp, style: .time)
-                        .font(.caption).foregroundColor(.secondary)
+                        .font(HMIStyle.metaFont).foregroundColor(.secondary)
                 }
                 .width(70)
             }
@@ -273,61 +349,77 @@ struct MonitorView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     // Header card
-                    VStack(alignment: .leading, spacing: 4) {
+                    VStack(alignment: .leading, spacing: HMIStyle.spacingXS) {
                         Text(tag.name)
-                            .font(.system(.headline, design: .monospaced))
+                            .font(.system(.title3, design: .monospaced).bold())
                             .lineLimit(2)
                         Text(tag.nodeId)
-                            .font(.caption).foregroundColor(.secondary).lineLimit(1)
+                            .font(HMIStyle.metaFont).foregroundColor(.secondary).lineLimit(1)
                     }
-                    .padding()
+                    .padding(HMIStyle.spacingM)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color(nsColor: .windowBackgroundColor))
 
                     Divider()
 
                     // Live values
-                    VStack(alignment: .leading, spacing: 14) {
-                        valueRow("Current Value",
+                    VStack(alignment: .leading, spacing: HMIStyle.spacingL) {
+                        valueRow("CURRENT VALUE",
                                  content: Text(tag.formattedValue)
-                                    .font(.system(.title2, design: .monospaced).bold()))
+                                    .font(HMIStyle.processValueFont))
 
                         HStack(spacing: 6) {
-                            Circle().fill(qualityColor(tag.quality)).frame(width: 9, height: 9)
-                            Text(tag.quality.description).font(.caption)
+                            Circle().fill(HMIStyle.qualityColor(tag.quality))
+                                .frame(width: HMIStyle.qualityDotSize, height: HMIStyle.qualityDotSize)
+                            Text(tag.quality.description)
+                                .font(HMIStyle.fieldLabelFont)
+                                .foregroundColor(HMIStyle.qualityColor(tag.quality))
                         }
 
-                        valueRow("Last Updated",
-                                 content: Text(tag.timestamp, style: .time).font(.caption))
+                        valueRow("LAST UPDATED",
+                                 content: Text(tag.timestamp, style: .time).font(HMIStyle.fieldLabelFont))
 
                         if let desc = tag.description, !desc.isEmpty {
-                            valueRow("Description",
-                                     content: Text(desc).font(.caption))
+                            valueRow("DESCRIPTION",
+                                     content: Text(desc).font(HMIStyle.fieldLabelFont))
                         }
 
                         if let config = alarmManager.alarmConfigs.first(where: { $0.tagName == tag.name }) {
-                            VStack(alignment: .leading, spacing: 5) {
+                            VStack(alignment: .leading, spacing: HMIStyle.spacingXS) {
                                 HStack(spacing: 5) {
-                                    Image(systemName: "bell.fill").font(.caption).foregroundColor(.orange)
-                                    Text("Alarm Limits").font(.caption.bold()).foregroundColor(.orange)
+                                    Image(systemName: "bell.fill").font(.caption)
+                                        .foregroundColor(HMIStyle.colorWarning)
+                                    Text("ALARM LIMITS").font(.caption.bold())
+                                        .foregroundColor(HMIStyle.colorWarning)
                                 }
                                 let fmt = { (v: Double) -> String in
                                     v.truncatingRemainder(dividingBy: 1) == 0
                                         ? String(Int(v)) : String(format: "%.4g", v)
                                 }
-                                if let hh = config.highHigh { alarmLimitRow("Hi-Hi", fmt(hh), .red) }
-                                if let h  = config.high     { alarmLimitRow("High",  fmt(h),  .orange) }
-                                if let l  = config.low      { alarmLimitRow("Low",   fmt(l),  .orange) }
-                                if let ll = config.lowLow   { alarmLimitRow("Lo-Lo", fmt(ll), .red) }
+                                if let hh = config.highHigh { alarmLimitRow("HH", fmt(hh), HMIStyle.colorCritical) }
+                                if let h  = config.high     { alarmLimitRow("HI", fmt(h),  HMIStyle.colorWarning) }
+                                if let l  = config.low      { alarmLimitRow("LO", fmt(l),  HMIStyle.colorWarning) }
+                                if let ll = config.lowLow   { alarmLimitRow("LL", fmt(ll), HMIStyle.colorCritical) }
                             }
                         }
                     }
-                    .padding()
+                    .padding(HMIStyle.spacingM)
 
                     Divider()
 
                     // Actions
                     VStack(spacing: 8) {
+                        if sessionManager.canWrite && tag.dataType != .calculated && tag.dataType != .totalizer {
+                            Button {
+                                showWriteSheet = true
+                            } label: {
+                                Label("Write Value…", systemImage: "pencil.line")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.orange)
+                        }
+
                         Button {
                             addToTrends(tag.name)
                             selectedTab = .trends
@@ -344,6 +436,15 @@ struct MonitorView: View {
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.bordered)
+
+                        Button(role: .destructive) {
+                            removeTag(tag)
+                        } label: {
+                            Label("Remove Tag", systemImage: "trash")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.red)
                     }
                     .padding()
                     .background(Color(nsColor: .controlBackgroundColor))
@@ -363,18 +464,22 @@ struct MonitorView: View {
     @ViewBuilder
     private func valueRow<C: View>(_ label: String, content: C) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(label).font(.caption).foregroundColor(.secondary)
+            Text(label)
+                .font(HMIStyle.fieldLabelFont)
+                .foregroundColor(.secondary)
+                .textCase(.uppercase)
+                .tracking(0.4)
             content
         }
     }
 
     private func alarmLimitRow(_ label: String, _ value: String, _ color: Color) -> some View {
-        HStack(spacing: 6) {
+        HStack(spacing: HMIStyle.spacingXS) {
             Text(label)
-                .font(.caption2).foregroundColor(.secondary)
-                .frame(width: 38, alignment: .leading)
+                .font(HMIStyle.metaFont).foregroundColor(.secondary)
+                .frame(width: 28, alignment: .leading)
             Text(value)
-                .font(.system(.caption, design: .monospaced))
+                .font(HMIStyle.alarmValueFont)
                 .foregroundColor(color)
         }
     }
@@ -385,6 +490,18 @@ struct MonitorView: View {
         names.insert(tagName)
         trendTagNames   = names.sorted().joined(separator: ",")
         trendFocusedTag = tagName
+    }
+
+    /// Remove a tag from the engine, historian, and OPC-UA poll list.
+    private func removeTag(_ tag: Tag) {
+        if selectedTagId == tag.id { selectedTagId = nil }
+        opcuaService.unsubscribe(nodeId: tag.nodeId)
+        tagEngine.removeTag(named: tag.name)
+        // Also remove from trend selection if present
+        var names = Set(trendTagNames.split(separator: ",").map(String.init).filter { !$0.isEmpty })
+        names.remove(tag.name)
+        trendTagNames = names.sorted().joined(separator: ",")
+        if trendFocusedTag == tag.name { trendFocusedTag = "" }
     }
 
     private var selectedTag: Tag? {
@@ -400,10 +517,6 @@ struct MonitorView: View {
             let q = selectedQuality == nil || tag.quality == selectedQuality
             return s && q
         }
-    }
-
-    private func qualityColor(_ q: TagQuality) -> Color {
-        switch q { case .good: return .green; case .bad: return .red; case .uncertain: return .yellow }
     }
 
     private var connectionColor: Color {
@@ -437,7 +550,10 @@ private struct InlineAlarmConfigPanel: View {
                     Text("Tag")
                         .frame(minWidth: 140, maxWidth: .infinity, alignment: .leading)
                     Group {
-                        Text("Hi-Hi"); Text("High"); Text("Low"); Text("Lo-Lo")
+                        Text("HH").foregroundColor(HMIStyle.colorCritical)
+                        Text("HI").foregroundColor(HMIStyle.colorWarning)
+                        Text("LO").foregroundColor(HMIStyle.colorWarning)
+                        Text("LL").foregroundColor(HMIStyle.colorCritical)
                     }
                     .frame(width: 72)
                     .multilineTextAlignment(.center)
@@ -445,8 +561,8 @@ private struct InlineAlarmConfigPanel: View {
                 }
                 .font(.caption.bold())
                 .foregroundColor(.secondary)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 6)
+                .padding(.horizontal, HMIStyle.spacingM)
+                .padding(.vertical, HMIStyle.spacingS)
                 .background(Color(nsColor: .controlBackgroundColor))
 
                 Divider()
@@ -495,10 +611,10 @@ private struct InlineAlarmRow: View {
             // Tag name + "alarm set" badge
             VStack(alignment: .leading, spacing: 1) {
                 Text(tag.name)
-                    .font(.system(.body, design: .monospaced))
+                    .font(HMIStyle.tagNameFont)
                     .lineLimit(1)
                 if existingConfig != nil {
-                    Text("alarm set").font(.caption2).foregroundColor(.green)
+                    Text("alarm set").font(HMIStyle.metaFont).foregroundColor(HMIStyle.colorNormal)
                 }
             }
             .frame(minWidth: 140, maxWidth: .infinity, alignment: .leading)
@@ -520,7 +636,7 @@ private struct InlineAlarmRow: View {
             .disabled(existingConfig == nil)
             .frame(width: 22)
         }
-        .padding(.vertical, 3)
+        .padding(.vertical, HMIStyle.spacingXS)
         .onAppear   { loadValues() }
         .onDisappear { if isDirty { commitConfig() } }
     }

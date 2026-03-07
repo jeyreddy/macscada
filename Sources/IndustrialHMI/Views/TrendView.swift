@@ -1,3 +1,41 @@
+// MARK: - TrendView.swift
+//
+// Historical trend viewer modelled on the Apple Stocks app — tag list on the left,
+// detail chart on the right. Always alive in MainView's ZStack so state persists.
+//
+// ── Layout ────────────────────────────────────────────────────────────────────
+//   HSplitView:
+//     Left  — tagListPanel: searchable list of monitored tags with mini sparklines
+//             and live value chips. Tap = set focusedTagName.
+//     Right — detailPanel: full Swift Charts LineChart for focusedTagName
+//             with time-range picker, refresh button, and export button.
+//
+// ── Monitored Tags ────────────────────────────────────────────────────────────
+//   @AppStorage("trend.selectedTags") persists a comma-separated list of tag names.
+//   syncMonitoredTags() reads this and intersects with TagEngine.tags to build
+//   monitoredTags: Set<String> (removes stale names for deleted tags).
+//   Operators add/remove tags via the tag list "+/-" button (toggles in/out of set).
+//
+// ── Time Ranges ───────────────────────────────────────────────────────────────
+//   TimeRange: .last15Min, .last1Hour, .last8Hours, .last24Hours, .last7Days
+//   @AppStorage("trend.timeRange") persists the selected range.
+//   chartStart = Date() - timeRange.duration; chartEnd = Date().
+//   Auto-refresh timer fires every 30 s when the view is visible.
+//
+// ── Historical Data ───────────────────────────────────────────────────────────
+//   loadHistoricalData() fetches from Historian for all monitoredTags in parallel
+//   via async let / TaskGroup. historicalData: [tagName → [HistoricalDataPoint]].
+//   Each HistoricalDataPoint: (timestamp: Date, value: Double).
+//   Swift Charts renders as LineMark with tag-specific color from tagColors dictionary.
+//
+// ── "View in Trends" Deep Link ────────────────────────────────────────────────
+//   MonitorView sets @AppStorage("trend.focusedTag") when "View in Trends" is tapped.
+//   TrendView's .onChange(of: persistedFocusedTag) picks this up and sets focusedTagName,
+//   also adding the tag to monitoredTags if not already present.
+//
+// ── Export ────────────────────────────────────────────────────────────────────
+//   TrendExportSheet: select tags + time range → CSV download via CSVBuilder.
+
 import SwiftUI
 import Charts
 
@@ -6,6 +44,7 @@ import Charts
 struct TrendView: View {
     @EnvironmentObject var tagEngine:    TagEngine
     @EnvironmentObject var alarmManager: AlarmManager
+    @EnvironmentObject var dataService:  DataService
 
     // Persisted state
     @AppStorage("trend.selectedTags")  private var persistedTagNames:  String = ""
@@ -22,6 +61,7 @@ struct TrendView: View {
     @State private var chartEnd:       Date                           = Date()
     @State private var searchText:     String                         = ""
     @State private var refreshTimer:   Timer?                         = nil
+    @State private var showExportSheet: Bool                          = false
 
     var body: some View {
         HSplitView {
@@ -37,6 +77,14 @@ struct TrendView: View {
         .onAppear { setupOnAppear() }
         .onChange(of: tagEngine.tagCount)     { _, _ in syncMonitoredTags() }
         .onChange(of: persistedTagNames)      { _, _ in syncMonitoredTags() }
+        .sheet(isPresented: $showExportSheet) {
+            TrendExportSheet(
+                availableTags:    Array(monitoredTags),
+                preselectedTags:  monitoredTags,
+                currentTimeRange: timeRange
+            )
+            .environmentObject(dataService)
+        }
         .onChange(of: persistedFocusedTag)    { _, new in
             // "View in Trends" from MonitorView has updated the focus
             if !new.isEmpty && monitoredTags.contains(new) {
@@ -300,6 +348,15 @@ struct TrendView: View {
                     persistedTimeRange = timeRange.rawValue
                     Task { await loadData() }
                 }
+
+                Button {
+                    showExportSheet = true
+                } label: {
+                    Label("Export", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Export tag history to CSV")
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)

@@ -1,3 +1,39 @@
+// MARK: - HMIFaceplateView.swift
+//
+// Run-mode detail popover shown when an operator taps an HMI object with a tag binding.
+// Displays live tag value, a 15-minute mini-trend chart, and the object's active alarms.
+//
+// ── Layout (380 pt wide) ──────────────────────────────────────────────────────
+//   headerSection  — tag name + description/label + alarm severity dot
+//   valueSection   — large live value with quality badge (Good/Uncertain/Bad)
+//                    unit label + last-updated timestamp
+//   miniTrendSection — Swift Charts LineChart of last 15 min of historian data
+//                      loaded via Historian.queryTagHistory(tagName:from:to:)
+//   alarmsSection  — appears only when tagAlarms is non-empty
+//                    lists each alarm's severity, state, message, and Acknowledge button
+//
+// ── Data Loading ──────────────────────────────────────────────────────────────
+//   .task { await loadHistory() } fires on appear.
+//   loadHistory() queries historian for the last 15 minutes of HistoricalDataPoint.
+//   isLoading drives a ProgressView placeholder in miniTrendSection.
+//   No auto-refresh; operator can dismiss/re-open to refresh the trend.
+//
+// ── Alarm Severity Indicator ──────────────────────────────────────────────────
+//   worstSeverity: computed from tagAlarms → max severity among active alarms.
+//   Shown as a colored circle in the header (red=critical, orange=warning, blue=info).
+//   severityColor(_ severity:) maps AlarmSeverity → Color.
+//
+// ── Acknowledge Button ────────────────────────────────────────────────────────
+//   Only shown if alarm.state.requiresAction (UnackActive or UnackRTN).
+//   Calls alarmManager.acknowledgeAlarm(alarm, by: sessionManager.currentOperator.username).
+//   Respects role: only visible if sessionManager.currentOperator.canAcknowledgeAlarms.
+//
+// ── Tag Value Display ─────────────────────────────────────────────────────────
+//   Analog tags: formatted with tag.displayFormat (printf, e.g. "%.1f") + tag.unit.
+//   Digital tags: tag.displayOnText / displayOffText (e.g. "RUNNING" / "STOPPED").
+//   String tags: raw string value.
+//   TagQuality shown as a badge (green=Good, yellow=Uncertain, red=Bad).
+
 import SwiftUI
 import Charts
 
@@ -7,8 +43,9 @@ import Charts
 struct HMIFaceplateView: View {
     let object: HMIObject
 
-    @EnvironmentObject var tagEngine: TagEngine
-    @EnvironmentObject var alarmManager: AlarmManager
+    @EnvironmentObject var tagEngine:      TagEngine
+    @EnvironmentObject var alarmManager:   AlarmManager
+    @EnvironmentObject var sessionManager: SessionManager
 
     @State private var historicalData: [HistoricalDataPoint] = []
     @State private var isLoading = false
@@ -210,11 +247,14 @@ struct HMIFaceplateView: View {
             }
 
             // Ack button — for any alarm that still requires operator action
-            if alarm.state.requiresAction {
-                Button("Ack") { alarmManager.acknowledgeAlarm(alarm) }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .tint(alarm.state == .unacknowledgedRTN ? .green : .orange)
+            if alarm.state.requiresAction && sessionManager.canAcknowledge {
+                Button("Ack") {
+                    alarmManager.acknowledgeAlarm(alarm, by: sessionManager.currentUsername)
+                    sessionManager.recordActivity()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(alarm.state == .unacknowledgedRTN ? .green : .orange)
             }
         }
         .padding(.horizontal)
@@ -258,6 +298,8 @@ struct HMIFaceplateView: View {
         case .unacknowledgedRTN:    return .green
         case .normal:               return .secondary
         case .suppressed:           return .gray
+        case .shelved:              return .purple
+        case .outOfService:         return .gray
         }
     }
 

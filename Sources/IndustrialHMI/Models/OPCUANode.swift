@@ -1,6 +1,29 @@
 import Foundation
 
-/// Represents a node in the OPC-UA address space
+// MARK: - OPCUANode.swift
+//
+// Data models for the OPC-UA address space browser (OPCUABrowserView).
+//
+// ── OPC-UA address space ──────────────────────────────────────────────────────
+//   An OPC-UA server exposes all its data as a tree of Nodes.
+//   Each node has a NodeId (e.g. "ns=2;s=Tank1.Level") and a NodeClass.
+//   OPCUABrowserViewModel fetches children lazily from the server via browse() calls.
+//
+// ── Node classes ─────────────────────────────────────────────────────────────
+//   Object   — container for other nodes (e.g. a device or folder)
+//   Variable — a node with a live value (temperature, pressure, etc.)
+//   Method   — callable procedure on the server
+//   ObjectType/VariableType — type definitions
+//   DataType — describes the data format (Int32, Float, String, …)
+//   View     — custom subset of the address space
+//
+// ── Relationship to Tag ───────────────────────────────────────────────────────
+//   OPCUANode is browse-time metadata — it is NOT the same as Tag.
+//   When the operator drags an OPCUANode (Variable class) to the tag list,
+//   TagEngine creates a new Tag with nodeId = node.nodeId and name = node.displayName.
+//   After that, TagEngine polls the nodeId via OPC-UA subscriptions.
+
+/// Represents a node in the OPC-UA address space.
 struct OPCUANode: Identifiable, Hashable {
     let id: String  // NodeId as string
     let nodeId: String
