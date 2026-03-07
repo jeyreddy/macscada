@@ -392,57 +392,129 @@ struct HMI3DSceneView: NSViewRepresentable {
     }
 
     // MARK: - Label + Value Badge Management
+    //
+    // Label nodes are cached by equipment ID.  The node is only removed and
+    // recreated when its text content or showLabels flag actually changes.
+    // Position updates (from drag-to-move) are applied in-place via SCNTransaction
+    // so no SCNText geometry is reallocated on every tag-poll update cycle.
 
     private func updateLabels(in root: SCNNode) {
-        // Remove old label and value-badge nodes each frame (lightweight SCNText, no geometry cost)
-        root.childNodes.filter {
-            $0.name?.hasPrefix("label_") == true || $0.name?.hasPrefix("val_") == true
-        }.forEach { $0.removeFromParentNode() }
-
         for equip in scene3D.equipment {
-            guard let equipNode = root.childNode(withName: equip.nodeName, recursively: false) else { continue }
+            guard let equipNode = root.childNode(withName: equip.nodeName, recursively: false) else {
+                // Equipment node not yet added — remove any stale label from a previous cycle
+                root.childNode(withName: "label_\(equip.id.uuidString)", recursively: false)?.removeFromParentNode()
+                root.childNode(withName: "val_\(equip.id.uuidString)",   recursively: false)?.removeFromParentNode()
+                continue
+            }
+
             let (_, maxBB) = equipNode.boundingBox
             let topY = Float(maxBB.y) * equip.scaleY
 
             // ── Equipment name label ─────────────────────────────────────────────
+            let labelName = "label_\(equip.id.uuidString)"
             if scene3D.showLabels {
-                let text = SCNText(string: equip.label, extrusionDepth: 0.01)
-                text.font = NSFont.boldSystemFont(ofSize: 0.3)
-                text.firstMaterial?.diffuse.contents = NSColor.white
-                text.firstMaterial?.lightingModel = .constant
-
-                let labelNode = SCNNode(geometry: text)
-                labelNode.name = "label_\(equip.id.uuidString)"
-                labelNode.scale = SCNVector3(0.4, 0.4, 0.4)
-                labelNode.constraints = [makeBillboard()]
-                labelNode.position = SCNVector3(equip.posX - 0.3, equip.posY + topY + 0.3, equip.posZ)
-                root.addChildNode(labelNode)
+                let labelPos = SCNVector3(equip.posX - 0.3, equip.posY + topY + 0.3, equip.posZ)
+                if let existing = root.childNode(withName: labelName, recursively: false) {
+                    // Check whether the text changed (stored as user attribute)
+                    let cachedText = existing.value(forKey: "labelText") as? String ?? ""
+                    if cachedText == equip.label {
+                        // Same text — only move the node, no geometry rebuild
+                        SCNTransaction.begin()
+                        SCNTransaction.animationDuration = 0
+                        existing.position = labelPos
+                        SCNTransaction.commit()
+                    } else {
+                        // Label text changed — rebuild geometry once
+                        existing.removeFromParentNode()
+                        root.addChildNode(makeLabelNode(text: equip.label, name: labelName,
+                                                        position: labelPos))
+                    }
+                } else {
+                    root.addChildNode(makeLabelNode(text: equip.label, name: labelName,
+                                                    position: labelPos))
+                }
+            } else {
+                // showLabels toggled off — remove label if present
+                root.childNode(withName: labelName, recursively: false)?.removeFromParentNode()
             }
 
-            // ── Live value badge (shown whenever a tag is bound) ─────────────────
-            if let tag = equip.tagBinding {
-                let liveVal  = liveValues[tag]
+            // ── Live value badge ─────────────────────────────────────────────────
+            let valName  = "val_\(equip.id.uuidString)"
+            if let tagKey = equip.tagBinding {
+                let liveVal  = liveValues[tagKey]
                 let valStr   = liveVal.map { String(format: "%.1f", $0) } ?? "---"
-                // Green when live data is flowing; yellow when tag is bound but no data yet
                 let valColor: NSColor = liveVal != nil
                     ? NSColor(red: 0.10, green: 1.00, blue: 0.30, alpha: 1.0)
                     : NSColor(red: 1.00, green: 0.75, blue: 0.00, alpha: 1.0)
-
-                let valText = SCNText(string: valStr, extrusionDepth: 0.005)
-                valText.font = NSFont.monospacedSystemFont(ofSize: 0.4, weight: .bold)
-                valText.firstMaterial?.diffuse.contents  = valColor
-                valText.firstMaterial?.emission.contents = valColor.withAlphaComponent(0.5)
-                valText.firstMaterial?.lightingModel     = .constant
-
-                let valNode = SCNNode(geometry: valText)
-                valNode.name = "val_\(equip.id.uuidString)"
-                valNode.scale = SCNVector3(0.4, 0.4, 0.4)
-                valNode.constraints = [makeBillboard()]
                 let badgeOffset: Float = scene3D.showLabels ? 0.85 : 0.50
-                valNode.position = SCNVector3(equip.posX - 0.2, equip.posY + topY + badgeOffset, equip.posZ)
-                root.addChildNode(valNode)
+                let valPos = SCNVector3(equip.posX - 0.2, equip.posY + topY + badgeOffset, equip.posZ)
+
+                if let existing = root.childNode(withName: valName, recursively: false) {
+                    let cachedStr   = existing.value(forKey: "valText")   as? String    ?? ""
+                    let cachedColor = existing.value(forKey: "valColor")  as? NSColor
+                    if cachedStr == valStr && cachedColor == valColor {
+                        // Value and colour unchanged — just reposition
+                        SCNTransaction.begin()
+                        SCNTransaction.animationDuration = 0
+                        existing.position = valPos
+                        SCNTransaction.commit()
+                    } else {
+                        // Value changed — rebuild text geometry
+                        existing.removeFromParentNode()
+                        root.addChildNode(makeValueNode(text: valStr, color: valColor,
+                                                        name: valName, position: valPos))
+                    }
+                } else {
+                    root.addChildNode(makeValueNode(text: valStr, color: valColor,
+                                                    name: valName, position: valPos))
+                }
+            } else {
+                root.childNode(withName: valName, recursively: false)?.removeFromParentNode()
             }
         }
+
+        // Remove orphaned label/val nodes for equipment that has been deleted
+        let liveIDs = Set(scene3D.equipment.map { $0.id.uuidString })
+        for child in root.childNodes {
+            guard let name = child.name else { continue }
+            if name.hasPrefix("label_") || name.hasPrefix("val_") {
+                let idPart = String(name.split(separator: "_", maxSplits: 1).last ?? "")
+                if !liveIDs.contains(idPart) {
+                    child.removeFromParentNode()
+                }
+            }
+        }
+    }
+
+    private func makeLabelNode(text: String, name: String, position: SCNVector3) -> SCNNode {
+        let geom = SCNText(string: text, extrusionDepth: 0.01)
+        geom.font = NSFont.boldSystemFont(ofSize: 0.3)
+        geom.firstMaterial?.diffuse.contents = NSColor.white
+        geom.firstMaterial?.lightingModel    = .constant
+        let node = SCNNode(geometry: geom)
+        node.name     = name
+        node.scale    = SCNVector3(0.4, 0.4, 0.4)
+        node.position = position
+        node.constraints = [makeBillboard()]
+        node.setValue(text, forKey: "labelText")
+        return node
+    }
+
+    private func makeValueNode(text: String, color: NSColor,
+                                name: String, position: SCNVector3) -> SCNNode {
+        let geom = SCNText(string: text, extrusionDepth: 0.005)
+        geom.font = NSFont.monospacedSystemFont(ofSize: 0.4, weight: .bold)
+        geom.firstMaterial?.diffuse.contents  = color
+        geom.firstMaterial?.emission.contents = color.withAlphaComponent(0.5)
+        geom.firstMaterial?.lightingModel     = .constant
+        let node = SCNNode(geometry: geom)
+        node.name     = name
+        node.scale    = SCNVector3(0.4, 0.4, 0.4)
+        node.position = position
+        node.constraints = [makeBillboard()]
+        node.setValue(text,  forKey: "valText")
+        node.setValue(color, forKey: "valColor")
+        return node
     }
 
     /// Billboard constraint — node always faces the camera on all axes (text readability).

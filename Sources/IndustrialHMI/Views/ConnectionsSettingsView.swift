@@ -165,6 +165,8 @@ struct ConnectionsSettingsView: View {
             MQTTSettingsView(configId: cfg.id)
         case .modbus:
             ModbusSettingsView(configId: cfg.id)
+        case .ethernetip:
+            EtherNetIPSettingsView(configId: cfg.id)
         }
     }
 
@@ -176,7 +178,7 @@ struct ConnectionsSettingsView: View {
             Text("Select a connection to configure it")
                 .foregroundColor(.secondary)
             if sessionManager.canManageTags {
-                Text("Use + to add OPC-UA, MQTT, or Modbus connections")
+                Text("Use + to add OPC-UA, MQTT, Modbus, or EtherNet/IP connections")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -204,17 +206,19 @@ struct ConnectionsSettingsView: View {
 
     private func typeIcon(_ type: DriverType) -> String {
         switch type {
-        case .opcua:  return "network"
-        case .mqtt:   return "antenna.radiowaves.left.and.right"
-        case .modbus: return "cable.connector.horizontal"
+        case .opcua:      return "network"
+        case .mqtt:       return "antenna.radiowaves.left.and.right"
+        case .modbus:     return "cable.connector.horizontal"
+        case .ethernetip: return "cpu.fill"
         }
     }
 
     private func typeColor(_ type: DriverType) -> Color {
         switch type {
-        case .opcua:  return .blue
-        case .mqtt:   return .orange
-        case .modbus: return .purple
+        case .opcua:      return .blue
+        case .mqtt:       return .orange
+        case .modbus:     return .purple
+        case .ethernetip: return .green
         }
     }
 
@@ -302,25 +306,28 @@ struct AddConnectionSheet: View {
 
     private var typeIcon: String {
         switch type {
-        case .opcua:  return "network"
-        case .mqtt:   return "antenna.radiowaves.left.and.right"
-        case .modbus: return "cable.connector.horizontal"
+        case .opcua:      return "network"
+        case .mqtt:       return "antenna.radiowaves.left.and.right"
+        case .modbus:     return "cable.connector.horizontal"
+        case .ethernetip: return "cpu.fill"
         }
     }
 
     private var typeColor: Color {
         switch type {
-        case .opcua:  return .blue
-        case .mqtt:   return .orange
-        case .modbus: return .purple
+        case .opcua:      return .blue
+        case .mqtt:       return .orange
+        case .modbus:     return .purple
+        case .ethernetip: return .green
         }
     }
 
     private var endpointPlaceholder: String {
         switch type {
-        case .opcua:  return "opc.tcp://host:4840"
-        case .mqtt:   return "broker.host:1883"
-        case .modbus: return "192.168.1.100:502"
+        case .opcua:      return "opc.tcp://host:4840"
+        case .mqtt:       return "broker.host:1883"
+        case .modbus:     return "192.168.1.100:502"
+        case .ethernetip: return "192.168.1.10  (port 44818)"
         }
     }
 

@@ -173,6 +173,24 @@ enum SceneKitEquipmentBuilder {
                 }
             }
 
+        case .horizontalTank, .separator:
+            // anim_fill is a box (width × height × length) aligned with world axes.
+            // height = 0.80 (full tank inner diameter); we scale its Y from 0 → 1
+            // and shift position.y so the bottom stays pinned to the tank bottom (y = 0.0).
+            if let fill = node.childNode(withName: "anim_fill", recursively: true) {
+                let maxH: CGFloat = 0.80    // full tank inner height in world Y
+                let newH  = CGFloat(max(0.01, fraction)) * maxH
+                fill.scale.y    = newH / maxH
+                fill.position.y = newH / 2  // pivot is at box centre, rise from y = 0
+                let color = fillLevelColor(fraction: fraction)
+                setMaterialColor(on: fill, color: color)
+                if !isAlarm {
+                    fill.geometry?.firstMaterial?.emission.contents = isTransparentMode
+                        ? color.withAlphaComponent(0.45)
+                        : NSColor.clear
+                }
+            }
+
         case .controlValve, .gateValve:
             if let disc = node.childNode(withName: "anim_disc", recursively: true) {
                 disc.position.y = CGFloat(0.4 + fraction * 0.4)
@@ -337,18 +355,22 @@ enum SceneKitEquipmentBuilder {
         shell.position = SCNVector3(0, 0.4, 0)
         root.addChildNode(shell)
 
-        let fillNode = SCNNode(geometry: SCNCylinder(radius: 0.36, height: 2.5))
-        fillNode.name = "anim_fill"
-        fillNode.geometry?.firstMaterial = {
+        // anim_level: vertical fill-level box that rises from the bottom of the tank shell.
+        // Height in world Y = 0 (empty) to 0.80 (full — tank inner diameter 0.72, centred at 0.4).
+        // Scaled from scaleY=0 (bottom) to scaleY=1 (full) via updateLiveAnimations.
+        let levelBox = SCNNode(geometry: SCNBox(width: 2.46, height: 0.80, length: 0.72, chamferRadius: 0))
+        levelBox.name = "anim_fill"
+        levelBox.geometry?.firstMaterial = {
             let m = SCNMaterial()
             m.lightingModel = .physicallyBased
             m.diffuse.contents = NSColor.blue.withAlphaComponent(0.55)
             m.isDoubleSided = true
             return m
         }()
-        fillNode.eulerAngles = SCNVector3(0, 0, cPI / 2)
-        fillNode.position = SCNVector3(0, 0.4, 0)
-        root.addChildNode(fillNode)
+        // Pivot at bottom: scale from scaleY=0.01 upward, position starts at tank bottom (y=0.0)
+        levelBox.scale    = SCNVector3(1, 0.01, 1)
+        levelBox.position = SCNVector3(0, 0.0, 0)
+        root.addChildNode(levelBox)
 
         for x: CGFloat in [-0.8, 0.8] {
             let saddle = SCNNode(geometry: SCNBox(width: 0.25, height: 0.3, length: 0.9, chamferRadius: 0.02))

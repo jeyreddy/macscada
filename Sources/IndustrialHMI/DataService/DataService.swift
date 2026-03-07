@@ -141,10 +141,12 @@ class DataService: ObservableObject {
         // Default instances (one per type) — replaced by setupDriversFromDB() on first start.
         let defaultMQTT    = MQTTDriver(tagEngine: engine, configDatabase: configDB)
         let defaultModbus  = ModbusDriver(tagEngine: engine, configDatabase: configDB)
+        let defaultEIP     = EtherNetIPDriver(tagEngine: engine, configDatabase: configDB)
         self.driverInstances = [
-            DriverInstance(id: "default-opcua",   config: DriverConfig(id: "default-opcua",   type: .opcua,   name: "OPC-UA",  endpoint: ""), driver: opcua),
-            DriverInstance(id: "default-mqtt",    config: DriverConfig(id: "default-mqtt",    type: .mqtt,    name: "MQTT",    endpoint: ""), driver: defaultMQTT),
-            DriverInstance(id: "default-modbus",  config: DriverConfig(id: "default-modbus",  type: .modbus,  name: "Modbus",  endpoint: ""), driver: defaultModbus)
+            DriverInstance(id: "default-opcua",   config: DriverConfig(id: "default-opcua",   type: .opcua,      name: "OPC-UA",      endpoint: ""), driver: opcua),
+            DriverInstance(id: "default-mqtt",    config: DriverConfig(id: "default-mqtt",    type: .mqtt,       name: "MQTT",        endpoint: ""), driver: defaultMQTT),
+            DriverInstance(id: "default-modbus",  config: DriverConfig(id: "default-modbus",  type: .modbus,     name: "Modbus",      endpoint: ""), driver: defaultModbus),
+            DriverInstance(id: "default-enip",    config: DriverConfig(id: "default-enip",    type: .ethernetip, name: "EtherNet/IP", endpoint: ""), driver: defaultEIP)
         ]
 
         Logger.shared.info("DataService initialized with \(self.driverInstances.count) default drivers")
@@ -270,6 +272,8 @@ class DataService: ObservableObject {
                 driver = MQTTDriver(tagEngine: tagEngine, configDatabase: configDatabase, configId: config.id)
             case .modbus:
                 driver = ModbusDriver(tagEngine: tagEngine, configDatabase: configDatabase, configId: config.id)
+            case .ethernetip:
+                driver = EtherNetIPDriver(tagEngine: tagEngine, configDatabase: configDatabase, configId: config.id)
             }
             instances.append(DriverInstance(id: config.id, config: config, driver: driver))
         }
@@ -285,9 +289,10 @@ class DataService: ObservableObject {
         try? await configDatabase.save(config)
         let driver: any DataDriver
         switch config.type {
-        case .opcua:  driver = OPCUAClientService()
-        case .mqtt:   driver = MQTTDriver(tagEngine: tagEngine, configDatabase: configDatabase, configId: config.id)
-        case .modbus: driver = ModbusDriver(tagEngine: tagEngine, configDatabase: configDatabase, configId: config.id)
+        case .opcua:      driver = OPCUAClientService()
+        case .mqtt:       driver = MQTTDriver(tagEngine: tagEngine, configDatabase: configDatabase, configId: config.id)
+        case .modbus:     driver = ModbusDriver(tagEngine: tagEngine, configDatabase: configDatabase, configId: config.id)
+        case .ethernetip: driver = EtherNetIPDriver(tagEngine: tagEngine, configDatabase: configDatabase, configId: config.id)
         }
         driverInstances.append(DriverInstance(id: config.id, config: config, driver: driver))
         if isRunning && config.enabled {

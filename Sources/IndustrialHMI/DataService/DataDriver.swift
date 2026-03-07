@@ -23,9 +23,10 @@ import Foundation
 // MARK: - Driver Types
 
 enum DriverType: String, Codable, CaseIterable {
-    case opcua  = "OPC-UA"
-    case mqtt   = "MQTT"
-    case modbus = "Modbus"
+    case opcua     = "OPC-UA"
+    case mqtt      = "MQTT"
+    case modbus    = "Modbus"
+    case ethernetip = "EtherNet/IP"
 }
 
 // MARK: - DataDriver Protocol

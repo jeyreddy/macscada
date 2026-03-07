@@ -473,21 +473,23 @@ struct ScreenGroupContent: View {
 
 // MARK: - Mini Trend Block
 //
-// Shows sparklines for up to 3 tags using the current tag value as a point.
-// The sparkline path is currently a horizontal flat line at 50 % height —
-// real historical data would require querying Historian.getHistory() asynchronously.
+// Shows sparklines for up to 3 tags using real historical data from the Historian.
+// Each MiniSparkline fires a single async task (keyed on tagID + minutes) to load
+// the last N minutes of history and normalise to a 0–1 polyline.
+// The task runs once per identity change, not on every render frame.
 
-/// Compact sparkline widget for up to 3 tags.
+/// Compact sparkline widget for up to 3 tags backed by real Historian data.
 struct TrendMiniContent: View {
     /// Up to 3 tag names to display (extras are silently dropped with .prefix(3)).
     let tagIDs: [String]
-    let minutes: Int   // intended history window — currently unused (future: Historian query)
+    /// History window in minutes shown by each sparkline.
+    let minutes: Int
     @EnvironmentObject var tagEngine: TagEngine
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             ForEach(tagIDs.prefix(3), id: \.self) { id in
-                MiniSparkline(tagID: id)
+                MiniSparkline(tagID: id, minutes: minutes)
             }
             if tagIDs.isEmpty {
                 Text("No tags").font(.caption2).foregroundColor(.secondary).padding()
@@ -497,10 +499,15 @@ struct TrendMiniContent: View {
     }
 }
 
-/// One sparkline row: [tag name + live value] [flat line at 50%].
+/// One sparkline row: [tag name + live value] [historical polyline].
+/// Points are loaded from Historian once via .task; re-loaded when tagID or minutes change.
 private struct MiniSparkline: View {
-    let tagID: String
+    let tagID:   String
+    let minutes: Int
     @EnvironmentObject var tagEngine: TagEngine
+
+    /// Normalised Y values (0.0 = min, 1.0 = max) for the sparkline polyline.
+    @State private var sparkPoints: [Double] = []
 
     var tag: Tag? { tagEngine.tags[tagID] }
 
@@ -515,19 +522,65 @@ private struct MiniSparkline: View {
             }
             .frame(width: 80, alignment: .leading)
 
-            // Sparkline placeholder — flat horizontal line at 50 % height.
-            // Replace Path with a real polyline when Historian query is available.
+            // Sparkline — real historical polyline when data is available,
+            // flat centre line while loading or when no history exists.
             GeometryReader { geo in
-                Path { p in
-                    let w = geo.size.width
-                    let h = geo.size.height
-                    p.move(to:    CGPoint(x: 0, y: h * 0.5))
-                    p.addLine(to: CGPoint(x: w, y: h * 0.5))
+                let w = geo.size.width
+                let h = geo.size.height
+                let color = tag?.quality.dot ?? Color.secondary
+
+                if sparkPoints.count >= 2 {
+                    Path { p in
+                        let step = w / Double(sparkPoints.count - 1)
+                        p.move(to: CGPoint(x: 0, y: h * (1.0 - sparkPoints[0])))
+                        for (i, pt) in sparkPoints.enumerated().dropFirst() {
+                            p.addLine(to: CGPoint(x: Double(i) * step,
+                                                  y: h * (1.0 - pt)))
+                        }
+                    }
+                    .stroke(color, lineWidth: 1.5)
+                    .opacity(0.85)
+                } else {
+                    // Loading / no data — flat line at mid-height
+                    Path { p in
+                        p.move(to: CGPoint(x: 0, y: h * 0.5))
+                        p.addLine(to: CGPoint(x: w, y: h * 0.5))
+                    }
+                    .stroke(color, style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                    .opacity(0.4)
                 }
-                .stroke(tag?.quality.dot ?? Color.secondary, lineWidth: 1.5)
-                .opacity(0.6)
             }
             .frame(height: 24)
         }
+        .task(id: "\(tagID)-\(minutes)") {
+            await loadSparklineHistory()
+        }
+    }
+
+    /// Queries the Historian for the last `minutes` of data and normalises to 0–1.
+    /// Runs on the Swift concurrency cooperative thread pool (not the main thread).
+    private func loadSparklineHistory() async {
+        guard let historian = tagEngine.historian else { return }
+        let end   = Date()
+        let start = end.addingTimeInterval(-Double(minutes) * 60)
+        // Fetch up to 60 points — enough for a crisp sparkline at any canvas size.
+        let raw = (try? await historian.getHistory(for: tagID, from: start,
+                                                    to: end, maxPoints: 60)) ?? []
+        guard raw.count >= 2 else { return }
+
+        let values = raw.map(\.value)
+        let minV   = values.min() ?? 0
+        let maxV   = values.max() ?? 1
+        let range  = maxV - minV
+
+        let normalised: [Double]
+        if range < 1e-9 {
+            // Flat process value — show line at 50 % rather than clamping to 0 or 1
+            normalised = values.map { _ in 0.5 }
+        } else {
+            normalised = values.map { ($0 - minV) / range }
+        }
+
+        await MainActor.run { sparkPoints = normalised }
     }
 }

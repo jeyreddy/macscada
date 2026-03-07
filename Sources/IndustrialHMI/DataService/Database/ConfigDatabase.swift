@@ -35,6 +35,31 @@
 import Foundation
 import SQLite
 
+// MARK: - EtherNet/IP Models
+
+/// CIP (Common Industrial Protocol) data types supported by the EtherNet/IP driver.
+enum EIPDataType: String, Codable, CaseIterable {
+    case real  = "REAL"   // 0xCA — 4-byte float (most common for analog tags)
+    case dint  = "DINT"   // 0xC4 — 4-byte signed int (counters, discrete states)
+    case int_  = "INT"    // 0xC3 — 2-byte signed int
+    case bool  = "BOOL"   // 0xC1 — 1-byte boolean (digital tags)
+    case dword = "DWORD"  // 0xD3 — 4-byte unsigned int (status words)
+}
+
+/// Maps one Allen-Bradley CIP symbolic tag to an app tag name.
+struct EIPTagMap: Identifiable, Codable {
+    var id:       String    = UUID().uuidString
+    /// App-side TagEngine tag name.
+    var tagName:  String
+    /// PLC symbolic tag name (e.g. "Motor_Speed", "Program:Main.Pump1_Run").
+    var cipTag:   String
+    /// CIP data type used when decoding the response value.
+    var dataType: EIPDataType = .real
+    /// Linear scaling: tagValue = rawValue * scale + offset
+    var scale:    Double = 1.0
+    var offset:   Double = 0.0
+}
+
 // MARK: - Modbus Models
 
 enum ModbusDataType: String, Codable, CaseIterable {
@@ -130,6 +155,16 @@ actor ConfigDatabase {
     private let mrOffset      = Expression<Double>("value_offset")
     private let mrDCId        = Expression<String?>("driver_config_id")  // FK to driver_configs
 
+    // enip_tag_maps table (EtherNet/IP CIP symbolic tags)
+    private let enipTags    = Table("enip_tag_maps")
+    private let etId        = Expression<String>("id")
+    private let etTagName   = Expression<String>("tag_name")
+    private let etCipTag    = Expression<String>("cip_tag")
+    private let etDataType  = Expression<String>("data_type")
+    private let etScale     = Expression<Double>("scale")
+    private let etOffset    = Expression<Double>("offset")
+    private let etDCId      = Expression<String?>("driver_config_id")
+
     init() {
         do {
             let fileManager = FileManager.default
@@ -204,9 +239,27 @@ actor ConfigDatabase {
                 t.column(mROffset)
             })
 
+            // enip_tag_maps table
+            let etTable    = Table("enip_tag_maps")
+            let eTId       = Expression<String>("id")
+            let eTTagName  = Expression<String>("tag_name")
+            let eTCipTag   = Expression<String>("cip_tag")
+            let eTDataType = Expression<String>("data_type")
+            let eTScale    = Expression<Double>("scale")
+            let eTOffset   = Expression<Double>("offset")
+            try connection.run(etTable.create(ifNotExists: true) { t in
+                t.column(eTId, primaryKey: true)
+                t.column(eTTagName)
+                t.column(eTCipTag)
+                t.column(eTDataType)
+                t.column(eTScale)
+                t.column(eTOffset)
+            })
+
             // Migration: add driver_config_id FK columns (idempotent — error = already exists)
             try? connection.execute("ALTER TABLE mqtt_subscriptions ADD COLUMN driver_config_id TEXT")
             try? connection.execute("ALTER TABLE modbus_register_maps ADD COLUMN driver_config_id TEXT")
+            try? connection.execute("ALTER TABLE enip_tag_maps ADD COLUMN driver_config_id TEXT")
 
             self.db = connection
             Logger.shared.info("ConfigDatabase initialized at: \(dbPath)")
@@ -262,6 +315,7 @@ actor ConfigDatabase {
         guard let db else { return }
         try db.run(mqttSubs.filter(msDCId == id).delete())
         try db.run(modbusRegs.filter(mrDCId == id).delete())
+        try db.run(enipTags.filter(etDCId == id).delete())
     }
 
     // MARK: - MQTT Subscriptions
@@ -389,6 +443,46 @@ actor ConfigDatabase {
                 valueOffset:  row[mrOffset]
             )
         }
+    }
+
+    // MARK: - EtherNet/IP Tag Maps
+
+    func saveEIPTagMap(_ map: EIPTagMap, forDriverId driverConfigId: String) throws {
+        guard let db else { return }
+        try db.run(enipTags.insert(or: .replace,
+            etId       <- map.id,
+            etTagName  <- map.tagName,
+            etCipTag   <- map.cipTag,
+            etDataType <- map.dataType.rawValue,
+            etScale    <- map.scale,
+            etOffset   <- map.offset,
+            etDCId     <- driverConfigId
+        ))
+    }
+
+    func deleteEIPTagMaps(forDriverId driverConfigId: String) throws {
+        guard let db else { return }
+        try db.run(enipTags.filter(etDCId == driverConfigId).delete())
+    }
+
+    func fetchEIPTagMaps(forDriverId driverConfigId: String) throws -> [EIPTagMap] {
+        guard let db else { return [] }
+        return try db.prepare(enipTags.filter(etDCId == driverConfigId)).compactMap { row in
+            guard let dt = EIPDataType(rawValue: row[etDataType]) else { return nil }
+            return EIPTagMap(
+                id:       row[etId],
+                tagName:  row[etTagName],
+                cipTag:   row[etCipTag],
+                dataType: dt,
+                scale:    row[etScale],
+                offset:   row[etOffset]
+            )
+        }
+    }
+
+    func deleteEIPTagMap(id: String) throws {
+        guard let db else { return }
+        try db.run(enipTags.filter(etId == id).delete())
     }
 
     // MARK: - Private
