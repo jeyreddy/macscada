@@ -424,7 +424,10 @@ struct HMIObjectView: View {
                 .padding(4 * scale)
         }
         .onTapGesture {
-            guard !isEditMode, let tagName = object.tagBinding?.tagName else { return }
+            guard !isEditMode, let tagName = object.tagBinding?.tagName else {
+                if isEditMode { onSelect() }
+                return
+            }
             isPressed = true
             Task {
                 try? await Task.sleep(for: .milliseconds(120))
@@ -476,7 +479,10 @@ struct HMIObjectView: View {
             }
         }
         .onTapGesture {
-            guard !isEditMode, let tagName = object.tagBinding?.tagName else { return }
+            guard !isEditMode, let tagName = object.tagBinding?.tagName else {
+                if isEditMode { onSelect() }
+                return
+            }
             let nextValue = isOn ? object.writeOffValue : object.writeOnValue
             onWrite?(tagName, nextValue)
         }
