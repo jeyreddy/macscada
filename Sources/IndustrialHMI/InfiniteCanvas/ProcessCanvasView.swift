@@ -62,6 +62,10 @@ struct ProcessCanvasView: View {
     /// View size updated by GeometryReader — used by fitToWindow and animateTo.
     @State private var viewSize:       CGSize  = .zero
 
+    // MARK: - Keyboard focus
+
+    @FocusState private var canvasFocused: Bool
+
     // MARK: - Designer sheets
 
     @State private var showAddBlock:   Bool    = false
@@ -122,6 +126,7 @@ struct ProcessCanvasView: View {
                 .onTapGesture {
                     // Deselect block when tapping empty canvas in design mode.
                     if isDesigning { selectedID = nil }
+                    canvasFocused = true   // re-acquire keyboard focus
                 }
                 .gesture(
                     DragGesture()
@@ -131,6 +136,7 @@ struct ProcessCanvasView: View {
                             if panStartPos == nil {
                                 panStartPos = CGPoint(x: v.startLocation.x, y: v.startLocation.y)
                                 panAtStart  = pan
+                                canvasFocused = true   // grab focus when panning
                             }
                             pan = CGPoint(x: panAtStart.x + v.translation.width,
                                           y: panAtStart.y + v.translation.height)
@@ -231,6 +237,31 @@ struct ProcessCanvasView: View {
                 Spacer()
                 canvasToolbar
             }
+
+            // Layer 9: Mini-map — bottom-left corner, shows all blocks + viewport rectangle.
+            // Tap or drag to navigate the canvas instantly.
+            if let blocks = canvasStore.active?.blocks, !blocks.isEmpty {
+                VStack {
+                    Spacer()
+                    HStack(alignment: .bottom) {
+                        ProcessCanvasMiniMap(
+                            blocks:   blocks,
+                            scale:    scale,
+                            pan:      pan,
+                            viewSize: viewSize
+                        ) { cx, cy in
+                            // Navigate viewport centre to tapped canvas point, keep current zoom.
+                            animateTo(x: cx, y: cy, scale: Double(scale))
+                        }
+                        .padding(.leading, 14)
+                        // Sit above the 52-pt toolbar (padding + border)
+                        .padding(.bottom, 56)
+                        Spacer()
+                    }
+                }
+                .allowsHitTesting(true)
+                .ignoresSafeArea()
+            }
         }
         .clipped()
         .background(Color(hex: canvasStore.active?.bgHex ?? "#0D1117"))
@@ -268,7 +299,50 @@ struct ProcessCanvasView: View {
         }
         .animation(.easeInOut(duration: 0.3), value: showComposite)
 
-        .onAppear { startEdgePanTimer() }
+        // MARK: - Keyboard focus + navigation shortcuts
+        //
+        //   Arrow keys (plain)     — pan 50 pt
+        //   Arrow keys (⇧ Shift)   — pan 200 pt (fast scroll)
+        //   = / +                  — zoom in  ×1.25
+        //   -                      — zoom out ×0.8
+        //   0 or f                 — fit all blocks to window
+        //
+        .focusable()
+        .focused($canvasFocused)
+        .onKeyPress(.leftArrow, phases: .down) { press in
+            let step: CGFloat = press.modifiers.contains(.shift) ? 200 : 50
+            withAnimation(.interactiveSpring()) { pan.x += step }
+            return .handled
+        }
+        .onKeyPress(.rightArrow, phases: .down) { press in
+            let step: CGFloat = press.modifiers.contains(.shift) ? 200 : 50
+            withAnimation(.interactiveSpring()) { pan.x -= step }
+            return .handled
+        }
+        .onKeyPress(.upArrow, phases: .down) { press in
+            let step: CGFloat = press.modifiers.contains(.shift) ? 200 : 50
+            withAnimation(.interactiveSpring()) { pan.y += step }
+            return .handled
+        }
+        .onKeyPress(.downArrow, phases: .down) { press in
+            let step: CGFloat = press.modifiers.contains(.shift) ? 200 : 50
+            withAnimation(.interactiveSpring()) { pan.y -= step }
+            return .handled
+        }
+        .onKeyPress(characters: CharacterSet(charactersIn: "=+"), phases: .down) { _ in
+            applyZoom(factor: 1.25, at: viewCenter); return .handled
+        }
+        .onKeyPress(characters: CharacterSet(charactersIn: "-"), phases: .down) { _ in
+            applyZoom(factor: 0.8, at: viewCenter); return .handled
+        }
+        .onKeyPress(characters: CharacterSet(charactersIn: "0f"), phases: .down) { _ in
+            fitToWindow(size: viewSize); return .handled
+        }
+
+        .onAppear {
+            canvasFocused = true
+            startEdgePanTimer()
+        }
 
         // Auto-zoom to selected block when selection changes in design mode.
         .onChange(of: selectedID) { _, newID in
@@ -608,6 +682,112 @@ struct CanvasScrollCapture: NSViewRepresentable {
         v.onKeyPan    = onKeyPan
         v.onKeyZoom   = onKeyZoom
         v.onFit       = onFit
+    }
+}
+
+// MARK: - ProcessCanvasMiniMap
+//
+// A 180×112-pt thumbnail of the entire canvas shown in the bottom-left corner.
+// It renders all blocks as filled rectangles and the current viewport as a blue
+// bordered rectangle.  Tap or drag on the minimap to pan the main canvas.
+//
+// Coordinate mapping:
+//   contentBounds  — bounding box of all blocks with 200-pt margin, in canvas space
+//   mapScale       — uniform scale that fits contentBounds inside the minimap
+//   toMap(cx, cy)  — canvas → minimap pixel
+//   toCanvas(mx,my)— minimap pixel → canvas centre
+
+struct ProcessCanvasMiniMap: View {
+    let blocks:    [CanvasBlock]
+    let scale:     CGFloat
+    let pan:       CGPoint
+    let viewSize:  CGSize
+    var onNavigate: (Double, Double) -> Void
+
+    private let mapW:     CGFloat = 180
+    private let mapH:     CGFloat = 112
+    private let mapPad:   CGFloat = 6
+
+    // Bounding box of all content with a comfortable margin.
+    private var contentBounds: CGRect {
+        guard !blocks.isEmpty else { return CGRect(x: 0, y: 0, width: 1280, height: 800) }
+        let minX = blocks.map { $0.x }.min()! - 200
+        let minY = blocks.map { $0.y }.min()! - 200
+        let maxX = blocks.map { $0.x + $0.w }.max()! + 200
+        let maxY = blocks.map { $0.y + $0.h }.max()! + 200
+        return CGRect(x: minX, y: minY, width: max(maxX - minX, 1), height: max(maxY - minY, 1))
+    }
+
+    // Uniform scale: canvas → minimap pixels.
+    private var mapScale: CGFloat {
+        min((mapW - mapPad * 2) / contentBounds.width,
+            (mapH - mapPad * 2) / contentBounds.height)
+    }
+
+    private func toMap(_ cx: Double, _ cy: Double) -> CGPoint {
+        CGPoint(
+            x: (cx - contentBounds.minX) * mapScale + mapPad,
+            y: (cy - contentBounds.minY) * mapScale + mapPad
+        )
+    }
+
+    private func toCanvas(_ mx: CGFloat, _ my: CGFloat) -> (Double, Double) {
+        let cx = (mx - mapPad) / mapScale + contentBounds.minX
+        let cy = (my - mapPad) / mapScale + contentBounds.minY
+        return (Double(cx), Double(cy))
+    }
+
+    // The visible viewport expressed as a rectangle in minimap space.
+    private var viewportRect: CGRect {
+        guard viewSize != .zero, scale > 0 else { return .zero }
+        let vpMinX = -pan.x / scale
+        let vpMinY = -pan.y / scale
+        let vpMaxX = (viewSize.width  - pan.x) / scale
+        let vpMaxY = (viewSize.height - pan.y) / scale
+        let tl = toMap(Double(vpMinX), Double(vpMinY))
+        let br = toMap(Double(vpMaxX), Double(vpMaxY))
+        return CGRect(x: tl.x, y: tl.y, width: br.x - tl.x, height: br.y - tl.y)
+    }
+
+    var body: some View {
+        Canvas { ctx, _ in
+            // Draw each block as a small filled rect.
+            for block in blocks {
+                let tl   = toMap(block.x, block.y)
+                let br   = toMap(block.x + block.w, block.y + block.h)
+                let rect = CGRect(x: tl.x, y: tl.y,
+                                  width: max(br.x - tl.x, 1), height: max(br.y - tl.y, 1))
+                ctx.fill(Path(roundedRect: rect, cornerRadius: 1),
+                         with: .color(.white.opacity(0.55)))
+            }
+            // Draw the current viewport rectangle.
+            let vp = viewportRect
+            if vp.width > 1 && vp.height > 1 {
+                let clipped = CGRect(
+                    x: max(vp.minX, mapPad - 1), y: max(vp.minY, mapPad - 1),
+                    width:  min(vp.width,  mapW - mapPad * 2 + 2),
+                    height: min(vp.height, mapH - mapPad * 2 + 2)
+                )
+                ctx.fill(Path(clipped), with: .color(.blue.opacity(0.12)))
+                ctx.stroke(Path(clipped), with: .color(.cyan.opacity(0.85)), lineWidth: 1.0)
+            }
+        }
+        .frame(width: mapW, height: mapH)
+        .background(Color.black.opacity(0.70))
+        .overlay(
+            RoundedRectangle(cornerRadius: 5)
+                .stroke(Color.white.opacity(0.18), lineWidth: 0.5)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+        // Tap or drag anywhere on the minimap to navigate.
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { v in
+                    let (cx, cy) = toCanvas(v.location.x, v.location.y)
+                    onNavigate(cx, cy)
+                }
+        )
+        .help("Mini-map — tap or drag to navigate")
     }
 }
 
