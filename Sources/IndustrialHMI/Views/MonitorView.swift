@@ -121,10 +121,21 @@ struct MonitorView: View {
 
     private var statusToolbar: some View {
         HStack(spacing: HMIStyle.spacingM) {
-            // Connection indicator
+            // ── Overall system status ──────────────────────────────────────
             HStack(spacing: 6) {
-                Circle().fill(connectionColor).frame(width: 10, height: 10)
-                Text(opcuaService.connectionState.rawValue).font(HMIStyle.statusLabelFont)
+                Circle().fill(systemStatusColor).frame(width: 10, height: 10)
+                Text(systemStatusLabel).font(HMIStyle.statusLabelFont)
+            }
+
+            // OPC-UA connection detail — only shown when data service is running
+            // and OPC-UA is the active protocol (not disconnected/idle)
+            if dataService.isRunning && opcuaService.connectionState != .disconnected {
+                HStack(spacing: 4) {
+                    Text("OPC-UA:").font(HMIStyle.statusMetaFont).foregroundColor(.secondary)
+                    Circle().fill(connectionColor).frame(width: 7, height: 7)
+                    Text(opcuaService.connectionState.rawValue)
+                        .font(HMIStyle.statusMetaFont).foregroundColor(.secondary)
+                }
             }
 
             Divider().frame(height: 20)
@@ -548,6 +559,22 @@ struct MonitorView: View {
         }
     }
 
+    /// Overall system status — reflects data collection engine, not just OPC-UA.
+    private var systemStatusColor: Color {
+        if dataService.isRunning {
+            return Configuration.simulationMode ? .blue : .green
+        }
+        return .gray
+    }
+
+    private var systemStatusLabel: String {
+        if dataService.isRunning {
+            return Configuration.simulationMode ? "Simulation" : "Running"
+        }
+        return "Stopped"
+    }
+
+    /// OPC-UA specific connection color (used in the secondary detail badge).
     private var connectionColor: Color {
         switch opcuaService.connectionState {
         case .connected: return .green; case .connecting: return .yellow
