@@ -75,6 +75,20 @@ struct Tag: Identifiable, Codable, Equatable {
     /// Example: "({Tank_Level} + {Tank2_Level}) / 2"
     var expression: String?
 
+    /// Custom label shown when a digital tag value is true (e.g. "Running", "Open", "Energized").
+    /// Falls back to "ON" when nil.
+    var onLabel: String?
+
+    /// Custom label shown when a digital tag value is false (e.g. "Stopped", "Closed", "De-energized").
+    /// Falls back to "OFF" when nil.
+    var offLabel: String?
+
+    /// Member source tags for composite tags (nil for non-composite tags).
+    var compositeMembers: [CompositeMember]?
+
+    /// Aggregation function applied to composite members (nil for non-composite tags).
+    var compositeAggregation: CompositeAggregation?
+
     // MARK: - Initialization
 
     init(
@@ -87,7 +101,11 @@ struct Tag: Identifiable, Codable, Equatable {
         unit: String? = nil,
         description: String? = nil,
         dataType: TagDataType = .analog,
-        expression: String? = nil
+        expression: String? = nil,
+        onLabel: String? = nil,
+        offLabel: String? = nil,
+        compositeMembers: [CompositeMember]? = nil,
+        compositeAggregation: CompositeAggregation? = nil
     ) {
         self.id = id
         self.name = name
@@ -99,6 +117,10 @@ struct Tag: Identifiable, Codable, Equatable {
         self.description = description
         self.dataType = dataType
         self.expression = expression
+        self.onLabel = onLabel
+        self.offLabel = offLabel
+        self.compositeMembers = compositeMembers
+        self.compositeAggregation = compositeAggregation
     }
     
     // MARK: - Computed Properties
@@ -113,6 +135,8 @@ struct Tag: Identifiable, Codable, Equatable {
             }
             return formatted
         case .digital(let val):
+            if val,  let label = onLabel  { return label }
+            if !val, let label = offLabel { return label }
             return val ? "ON" : "OFF"
         case .string(let val):
             return val
@@ -185,6 +209,37 @@ enum TagDataType: String, Codable, Equatable {
     case string     // Text data
     case calculated // Derived/computed values (formula expression)
     case totalizer  // Running accumulator: ∑(source_value × Δt) over time
+    case composite  // Aggregation of multiple tags from any driver source
+}
+
+// MARK: - Composite Tag Support
+
+/// A single member (source tag) in a composite tag definition.
+struct CompositeMember: Codable, Equatable, Identifiable {
+    var id:      UUID   = UUID()
+    var alias:   String          // human-readable alias, e.g. "sensor_a"
+    var tagName: String          // source tag name (from any driver)
+}
+
+/// The aggregation function applied across a composite tag's members.
+enum CompositeAggregation: String, Codable, Equatable, CaseIterable {
+    case average = "average"
+    case sum     = "sum"
+    case minimum = "minimum"
+    case maximum = "maximum"
+    case andAll  = "and_all"   // digital: true only when ALL members are non-zero
+    case orAny   = "or_any"    // digital: true when ANY member is non-zero
+
+    var displayName: String {
+        switch self {
+        case .average: return "Average"
+        case .sum:     return "Sum"
+        case .minimum: return "Minimum"
+        case .maximum: return "Maximum"
+        case .andAll:  return "AND (all true)"
+        case .orAny:   return "OR (any true)"
+        }
+    }
 }
 
 // MARK: - Tag Configuration

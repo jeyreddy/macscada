@@ -87,7 +87,10 @@ actor Historian {
     private let tcUnit       = Expression<String?>("unit")
     private let tcDesc       = Expression<String?>("description")
     private let tcAddedAt    = Expression<Int64>("added_at")
-    private let tcExpression = Expression<String?>("expression")
+    private let tcExpression     = Expression<String?>("expression")
+    private let tcOnLabel        = Expression<String?>("on_label")
+    private let tcOffLabel       = Expression<String?>("off_label")
+    private let tcCompositeJSON  = Expression<String?>("composite_json")
 
     // MARK: - alarm_configs table
 
@@ -243,6 +246,9 @@ actor Historian {
             t.column(tcExpression)
         })
         _ = try? db.run("ALTER TABLE tag_configs ADD COLUMN expression TEXT")
+        _ = try? db.run("ALTER TABLE tag_configs ADD COLUMN on_label TEXT")
+        _ = try? db.run("ALTER TABLE tag_configs ADD COLUMN off_label TEXT")
+        _ = try? db.run("ALTER TABLE tag_configs ADD COLUMN composite_json TEXT")
 
         // alarm_configs
         try db.run(alarmConfigs.create(ifNotExists: true) { t in
@@ -506,27 +512,59 @@ actor Historian {
 
     func saveTagConfig(_ tag: Tag) throws {
         let tsMs = Int64(Date().timeIntervalSince1970 * 1000)
+        // Encode composite members + aggregation as JSON when present
+        let compositeJSON: String? = {
+            guard tag.dataType == .composite,
+                  let members = tag.compositeMembers,
+                  let agg     = tag.compositeAggregation else { return nil }
+            struct CompositePayload: Codable {
+                let aggregation: String
+                let members: [CompositeMember]
+            }
+            let payload = CompositePayload(aggregation: agg.rawValue, members: members)
+            return (try? JSONEncoder().encode(payload)).flatMap { String(data: $0, encoding: .utf8) }
+        }()
         try db.run(tagConfigs.insert(
             or: .replace,
-            tcName       <- tag.name,
-            tcNodeId     <- tag.nodeId,
-            tcDataType   <- tag.dataType.rawValue,
-            tcUnit       <- tag.unit,
-            tcDesc       <- tag.description,
-            tcAddedAt    <- tsMs,
-            tcExpression <- tag.expression
+            tcName          <- tag.name,
+            tcNodeId        <- tag.nodeId,
+            tcDataType      <- tag.dataType.rawValue,
+            tcUnit          <- tag.unit,
+            tcDesc          <- tag.description,
+            tcAddedAt       <- tsMs,
+            tcExpression    <- tag.expression,
+            tcOnLabel       <- tag.onLabel,
+            tcOffLabel      <- tag.offLabel,
+            tcCompositeJSON <- compositeJSON
         ))
     }
 
     func loadTagConfigs() throws -> [Tag] {
         try db.prepare(tagConfigs).map { row in
-            Tag(
-                name:        row[tcName],
-                nodeId:      row[tcNodeId],
-                unit:        row[tcUnit],
-                description: row[tcDesc],
-                dataType:    TagDataType(rawValue: row[tcDataType]) ?? .analog,
-                expression:  row[tcExpression]
+            // Decode composite payload if present
+            var compositeMembers:     [CompositeMember]?   = nil
+            var compositeAggregation: CompositeAggregation? = nil
+            if let json = row[tcCompositeJSON], let data = json.data(using: .utf8) {
+                struct CompositePayload: Codable {
+                    let aggregation: String
+                    let members: [CompositeMember]
+                }
+                if let payload = try? JSONDecoder().decode(CompositePayload.self, from: data) {
+                    compositeMembers     = payload.members
+                    compositeAggregation = CompositeAggregation(rawValue: payload.aggregation)
+                }
+            }
+            return Tag(
+                name:                row[tcName],
+                nodeId:              row[tcNodeId],
+                unit:                row[tcUnit],
+                description:         row[tcDesc],
+                dataType:            TagDataType(rawValue: row[tcDataType]) ?? .analog,
+                expression:          row[tcExpression],
+                onLabel:             row[tcOnLabel],
+                offLabel:            row[tcOffLabel],
+                compositeMembers:    compositeMembers,
+                compositeAggregation: compositeAggregation
             )
         }
     }

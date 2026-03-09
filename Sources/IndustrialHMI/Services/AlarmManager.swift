@@ -187,7 +187,16 @@ class AlarmManager: ObservableObject {
               tag.quality == .good,
               let value = tag.value.numericValue else { return }
 
-        let (violated, severity, message) = config.checkViolation(value: value)
+        let (violated, severity, rawMessage) = config.checkViolation(value: value)
+        // For digital tags with custom on/off labels, replace the numeric threshold message
+        // with a human-readable state description (e.g. "Pump_Status is Running").
+        let message: String? = {
+            guard let raw = rawMessage else { return nil }
+            guard tag.dataType == .digital else { return raw }
+            if value != 0, let label = tag.onLabel  { return "\(tag.name) is \(label)" }
+            if value == 0, let label = tag.offLabel { return "\(tag.name) is \(label)" }
+            return raw
+        }()
         let currentState = alarmStates[tag.name]
 
         if violated, let severity, let message {

@@ -324,7 +324,7 @@ class AgentService: ObservableObject {
             case "delete_alarm_config":    return try toolDeleteAlarmConfig(input: input)
             case "acknowledge_alarm":      return try toolAcknowledgeAlarm(input: input)
             case "acknowledge_all_alarms": return try toolAcknowledgeAllAlarms(input: input)
-            case "list_hmi_objects":       return try toolListHMIObjects()
+            case "list_hmi_objects":       return try toolListHMIObjects(input: input)
             case "create_hmi_object":      return try toolCreateHMIObject(input: input)
             case "update_hmi_object":      return try toolUpdateHMIObject(input: input)
             case "delete_hmi_object":      return try toolDeleteHMIObject(input: input)
@@ -340,9 +340,12 @@ class AgentService: ObservableObject {
             case "get_tag_history":            return try await toolGetTagHistory(input: input)
             case "create_calculated_tag":      return try    toolCreateCalculatedTag(input: input)
             case "create_totalizer_tag":       return try    toolCreateTotalizerTag(input: input)
+            case "create_composite_tag":       return try    toolCreateCompositeTag(input: input)
             case "reset_totalizer":            return try    toolResetTotalizer(input: input)
             case "delete_tag":                 return try    toolDeleteTag(input: input)
             case "write_tag_values":           return try await toolWriteTagValues(input: input)
+            case "list_all_screens":           return try    toolListAllScreens()
+            case "create_hmi_screen":          return try    toolCreateHMIScreen(input: input)
             default:
                 return err("Unknown tool: \(name)")
             }
@@ -394,7 +397,15 @@ class AgentService: ObservableObject {
         var changed: [String] = []
         if let unit = strArg(input, "unit")        { tag.unit        = unit; changed.append("unit=\(unit)") }
         if let desc = strArg(input, "description") { tag.description = desc; changed.append("description set") }
+        // Digital status labels (on_label / off_label — also appear in alarm messages)
+        if let onL  = input["on_label"]?.value  as? String {
+            tag.onLabel  = onL.isEmpty ? nil : onL; changed.append("on_label=\(onL)")
+        }
+        if let offL = input["off_label"]?.value as? String {
+            tag.offLabel = offL.isEmpty ? nil : offL; changed.append("off_label=\(offL)")
+        }
         tagEngine.tags[name] = tag
+        if let h = tagEngine.historian { Task { try? await h.saveTagConfig(tag) } }
         return ok(["updated": true, "tag": name], "Updated \(name): \(changed.joined(separator: ", "))")
     }
 
@@ -477,12 +488,31 @@ class AgentService: ObservableObject {
                   "Acknowledged \(count) alarm(s) by \(by)")
     }
 
-    private func toolListHMIObjects() throws -> ToolResult {
-        let objects = hmiScreenStore.screen.objects.map { hmiObjectToDict($0) }
+    /// Resolve screen by name or return the current active screen.
+    /// Returns nil when `screenName` is provided but not found.
+    private func resolveScreen(_ screenName: String?) -> HMIScreen? {
+        guard let name = screenName, !name.isEmpty, name != "current" else {
+            return hmiScreenStore.screen
+        }
+        if let meta = hmiScreenStore.allScreenMeta.first(where: {
+            $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
+        }) {
+            return hmiScreenStore.loadScreen(id: meta.id)
+        }
+        return nil
+    }
+
+    private func toolListHMIObjects(input: [String: AnyCodable] = [:]) throws -> ToolResult {
+        let screenName = strArg(input, "screen_name")
+        guard let scr = resolveScreen(screenName) else {
+            let available = hmiScreenStore.allScreenMeta.map(\.name).joined(separator: ", ")
+            return err("Screen '\(screenName!)' not found. Available: \(available)")
+        }
+        let objects = scr.objects.map { hmiObjectToDict($0) }
         return ok(["objects": objects, "count": objects.count,
-                   "screen_name": hmiScreenStore.screen.name,
-                   "canvas": "\(Int(hmiScreenStore.screen.canvasWidth))×\(Int(hmiScreenStore.screen.canvasHeight))"],
-                  "\(objects.count) HMI object(s) on '\(hmiScreenStore.screen.name)'")
+                   "screen_name": scr.name,
+                   "canvas": "\(Int(scr.canvasWidth))×\(Int(scr.canvasHeight))"],
+                  "\(objects.count) HMI object(s) on '\(scr.name)'")
     }
 
     private func toolCreateHMIObject(input: [String: AnyCodable]) throws -> ToolResult {
@@ -514,9 +544,24 @@ class AgentService: ObservableObject {
             obj.tagBinding = binding
         }
 
-        hmiScreenStore.addObject(obj)
-        return ok(["created": true, "id": obj.id.uuidString, "type": typeStr],
-                  "Created \(objType.displayName) at (\(Int(x)),\(Int(y))) id=\(obj.id.uuidString.prefix(8))")
+        let screenName = strArg(input, "screen_name")
+        if let name = screenName, !name.isEmpty, name != "current" {
+            // Targeted screen: add to a named screen without switching the active screen
+            guard let meta = hmiScreenStore.allScreenMeta.first(where: {
+                $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
+            }) else {
+                let available = hmiScreenStore.allScreenMeta.map(\.name).joined(separator: ", ")
+                return err("Screen '\(name)' not found. Available: \(available)")
+            }
+            hmiScreenStore.addObjectToScreen(id: meta.id, obj)
+            return ok(["created": true, "id": obj.id.uuidString, "type": typeStr, "screen": name],
+                      "Created \(objType.displayName) on '\(name)' at (\(Int(x)),\(Int(y))) id=\(obj.id.uuidString.prefix(8))")
+        } else {
+            hmiScreenStore.addObject(obj)
+            return ok(["created": true, "id": obj.id.uuidString, "type": typeStr,
+                       "screen": hmiScreenStore.screen.name],
+                      "Created \(objType.displayName) at (\(Int(x)),\(Int(y))) id=\(obj.id.uuidString.prefix(8))")
+        }
     }
 
     private func toolUpdateHMIObject(input: [String: AnyCodable]) throws -> ToolResult {
@@ -612,6 +657,28 @@ class AgentService: ObservableObject {
         default:
             return err("Unknown action: \(action). Valid: connect, disconnect, start_polling, pause_polling")
         }
+    }
+
+    private func toolListAllScreens() throws -> ToolResult {
+        let screens: [[String: Any]] = hmiScreenStore.allScreenMeta.map { meta in
+            let isCurrent = meta.id == hmiScreenStore.currentScreenId
+            let scr       = hmiScreenStore.loadScreen(id: meta.id)
+            return [
+                "name":       meta.name,
+                "id":         meta.id.uuidString,
+                "is_current": isCurrent,
+                "object_count": scr?.objects.count ?? 0
+            ]
+        }
+        return ok(["screens": screens, "count": screens.count,
+                   "current": hmiScreenStore.screen.name],
+                  "\(screens.count) HMI screen(s); current: '\(hmiScreenStore.screen.name)'")
+    }
+
+    private func toolCreateHMIScreen(input: [String: AnyCodable]) throws -> ToolResult {
+        let name = strArg(input, "name") ?? "New Screen"
+        hmiScreenStore.createScreen(name: name)
+        return ok(["created": name], "HMI screen '\(name)' created and switched to it.")
     }
 
     // MARK: - History Management
@@ -955,8 +1022,41 @@ class AgentService: ObservableObject {
         case .totalizer:
             tagEngine.removeTotalizerTag(name: tagName)
             return ok(["deleted": tagName], "Totalizer tag '\(tagName)' deleted.")
+        case .composite:
+            tagEngine.removeCompositeTag(name: tagName)
+            return ok(["deleted": tagName], "Composite tag '\(tagName)' deleted.")
         default:
-            return err("Tag '\(tagName)' is a hardware tag (type: \(tag.dataType.rawValue)). Only calculated and totalizer tags can be deleted via agent.")
+            return err("Tag '\(tagName)' is a hardware tag (type: \(tag.dataType.rawValue)). Only calculated, totalizer, and composite tags can be deleted via agent.")
+        }
+    }
+
+    private func toolCreateCompositeTag(input: [String: AnyCodable]) throws -> ToolResult {
+        guard let name = strArg(input, "name") else { throw AgentError.missingParameter("name") }
+        guard let aggStr = strArg(input, "aggregation") else { throw AgentError.missingParameter("aggregation") }
+        guard let aggregation = CompositeAggregation(rawValue: aggStr) else {
+            return err("Unknown aggregation '\(aggStr)'. Valid: average, sum, minimum, maximum, and_all, or_any")
+        }
+        let raw = input["members"]?.value
+        guard let membersRaw = raw as? [Any], !membersRaw.isEmpty else {
+            throw AgentError.missingParameter("members (array of {alias, tag_name})")
+        }
+        let members: [CompositeMember] = membersRaw.compactMap { item in
+            guard let d = item as? [String: Any],
+                  let tagName = d["tag_name"] as? String else { return nil }
+            return CompositeMember(alias: d["alias"] as? String ?? "", tagName: tagName)
+        }
+        guard !members.isEmpty else { return err("No valid members provided.") }
+
+        let unit        = strArg(input, "unit")
+        let description = strArg(input, "description")
+        do {
+            try tagEngine.addCompositeTag(name: name, members: members, aggregation: aggregation,
+                                          unit: unit, description: description)
+            let memberNames = members.map { $0.tagName }.joined(separator: ", ")
+            return ok(["created": name, "aggregation": aggStr, "member_count": members.count],
+                      "Composite tag '\(name)' created (\(aggStr) of: \(memberNames))")
+        } catch {
+            return err("Failed to create composite tag '\(name)': \(error.localizedDescription)")
         }
     }
 
@@ -1067,11 +1167,14 @@ enum AgentTools {
              required: ["tag_name"]),
 
         tool("update_tag_metadata",
-             "Updates the engineering unit and/or description for a tag. Does not change the live value.",
+             "Updates engineering unit, description, and/or custom on/off state labels for a tag. " +
+             "on_label and off_label are shown in formattedValue and in alarm messages for digital tags.",
              properties: [
                 "tag_name":    str("The tag to update."),
                 "unit":        str("Engineering unit string, e.g. '°C', '%', 'PSI'. Omit to leave unchanged."),
-                "description": str("Human-readable description. Omit to leave unchanged.")
+                "description": str("Human-readable description. Omit to leave unchanged."),
+                "on_label":    str("Custom text shown when a digital tag is true, e.g. 'Running', 'Open', 'Energized'."),
+                "off_label":   str("Custom text shown when a digital tag is false, e.g. 'Stopped', 'Closed', 'De-energized'.")
              ], required: ["tag_name"]),
 
         tool("list_alarm_configs",

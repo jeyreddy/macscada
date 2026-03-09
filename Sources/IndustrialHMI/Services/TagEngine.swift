@@ -98,6 +98,11 @@ class TagEngine: ObservableObject {
     /// totalizerTagName → state. Rebuilt from persisted tags on boot.
     private var totalizerStates: [String: TotalizerState] = [:]
 
+    // MARK: - Composite Tag Dependencies
+
+    /// sourceTagName → set of composite tag names that include it as a member.
+    private var compositeSources: [String: Set<String>] = [:]
+
     // MARK: - Cache Layer
 
     /// Per-tag cache entry tracking the last confirmed good value and bad-poll streak.
@@ -158,6 +163,15 @@ class TagEngine: ObservableObject {
             for tag in savedTags where tag.dataType == .totalizer {
                 if let sourceTagName = tag.expression {
                     totalizerStates[tag.name] = TotalizerState(sourceTagName: sourceTagName)
+                }
+            }
+
+            // Rebuild composite source map for persisted composite tags.
+            for tag in savedTags where tag.dataType == .composite {
+                if let members = tag.compositeMembers {
+                    for member in members {
+                        compositeSources[member.tagName, default: []].insert(tag.name)
+                    }
                 }
             }
             Logger.shared.info("Restored \(savedTags.count) tag configs from database")
@@ -348,6 +362,93 @@ class TagEngine: ObservableObject {
         return newDeps.contains(where: canReach)
     }
 
+    // MARK: - Composite Tags
+
+    /// Register a composite tag that aggregates values from multiple source tags,
+    /// potentially spanning different drivers (OPC-UA, MQTT, Modbus, EtherNet/IP).
+    /// The result is historised just like any other tag.
+    func addCompositeTag(
+        name: String,
+        members: [CompositeMember],
+        aggregation: CompositeAggregation,
+        unit: String? = nil,
+        description: String? = nil
+    ) throws {
+        guard !members.isEmpty else {
+            throw ExprError.syntaxError("Composite tag '\(name)' requires at least one member.")
+        }
+        // Remove previous registration if updating
+        if tags[name]?.dataType == .composite { removeCompositeTag(name: name) }
+
+        var tag = Tag(
+            name:                name,
+            nodeId:              "composite:\(name)",
+            value:               aggregation == .andAll || aggregation == .orAny
+                                     ? .digital(false) : .analog(0),
+            quality:             .uncertain,
+            unit:                unit,
+            description:         description,
+            dataType:            .composite,
+            compositeMembers:    members,
+            compositeAggregation: aggregation
+        )
+        addTag(tag)
+
+        // Register source dependencies
+        for member in members {
+            compositeSources[member.tagName, default: []].insert(name)
+        }
+
+        // Compute initial value
+        evaluateCompositeTag(name)
+        Logger.shared.info("Composite tag '\(name)' registered (\(aggregation.rawValue), \(members.count) members)")
+    }
+
+    /// Remove a composite tag and clean up source dependency entries.
+    func removeCompositeTag(name: String) {
+        if let tag = tags[name], let members = tag.compositeMembers {
+            for member in members {
+                compositeSources[member.tagName]?.remove(name)
+                if compositeSources[member.tagName]?.isEmpty == true {
+                    compositeSources.removeValue(forKey: member.tagName)
+                }
+            }
+        }
+        removeTag(named: name)
+    }
+
+    /// Evaluate a composite tag from its current member values.
+    /// Called whenever any member source tag updates.
+    private func evaluateCompositeTag(_ name: String) {
+        guard let tag = tags[name],
+              tag.dataType == .composite,
+              let members     = tag.compositeMembers,
+              let aggregation = tag.compositeAggregation else { return }
+
+        let values: [Double] = members.compactMap { tags[$0.tagName]?.value.numericValue }
+        guard !values.isEmpty else { return }
+
+        let result: TagValue
+        switch aggregation {
+        case .average: result = .analog(values.reduce(0, +) / Double(values.count))
+        case .sum:     result = .analog(values.reduce(0, +))
+        case .minimum: result = .analog(values.min()!)
+        case .maximum: result = .analog(values.max()!)
+        case .andAll:  result = .digital(values.allSatisfy { $0 != 0 })
+        case .orAny:   result = .digital(values.contains   { $0 != 0 })
+        }
+
+        var updated = tag
+        updated.value     = result
+        updated.quality   = .good
+        updated.timestamp = Date()
+        tags[name] = updated
+        if let num = result.numericValue, historian != nil {
+            historianBatch.append((tagName: name, value: num, timestamp: updated.timestamp))
+        }
+        onTagUpdated?(updated)
+    }
+
     // MARK: - Operator Write Model
 
     /// Stage a write request for operator confirmation.
@@ -440,6 +541,13 @@ class TagEngine: ObservableObject {
 
         // Re-evaluate any calculated tags that depend on this one.
         reevaluateExpressionsDepending(on: name)
+
+        // Re-evaluate composite tags that include this tag as a member.
+        if let dependentComposites = compositeSources[name] {
+            for compName in dependentComposites {
+                evaluateCompositeTag(compName)
+            }
+        }
 
         // Accumulate into any totalizer tags that use this tag as their source.
         if let v = value.numericValue {

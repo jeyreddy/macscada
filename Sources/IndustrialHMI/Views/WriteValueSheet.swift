@@ -81,7 +81,7 @@ struct WriteValueSheet: View {
             return true
         case .string:
             return !analogInput.trimmingCharacters(in: .whitespaces).isEmpty
-        case .calculated, .totalizer:
+        case .calculated, .totalizer, .composite:
             return false
         }
     }
@@ -129,6 +129,9 @@ struct WriteValueSheet: View {
                             .foregroundColor(.orange).font(.caption)
                     case .totalizer:
                         Label("Totalizer tags cannot be written.", systemImage: "exclamationmark.triangle")
+                            .foregroundColor(.orange).font(.caption)
+                    case .composite:
+                        Label("Composite tags cannot be written.", systemImage: "exclamationmark.triangle")
                             .foregroundColor(.orange).font(.caption)
                     }
                 }
@@ -199,6 +202,10 @@ struct WriteValueSheet: View {
             return
         case .totalizer:
             writeError = "Totalizer tags cannot be written."
+            isWriting  = false
+            return
+        case .composite:
+            writeError = "Composite tags cannot be written."
             isWriting  = false
             return
         }

@@ -96,10 +96,10 @@ struct MonitorView: View {
             // @StateObject ViewModel is never destroyed.
             HSplitView {
                 tagTablePane
-                    .frame(minWidth: 180, idealWidth: 300)
+                    .frame(minWidth: 150)
 
                 rightPane
-                    .frame(minWidth: 240, maxWidth: .infinity)
+                    .frame(minWidth: 200, maxWidth: .infinity)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -274,8 +274,10 @@ struct MonitorView: View {
                 TableColumn("Value") { tag in
                     Text(tag.formattedValue)
                         .font(HMIStyle.inlineValueFont)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
-                .width(min: 90)
+                .width(min: 70, ideal: 90)
 
                 TableColumn("Quality") { tag in
                     HStack(spacing: 4) {
@@ -284,15 +286,17 @@ struct MonitorView: View {
                         Text(tag.quality.description)
                             .font(HMIStyle.fieldLabelFont)
                             .foregroundColor(HMIStyle.qualityColor(tag.quality))
+                            .lineLimit(1)
                     }
                 }
-                .width(80)
+                .width(min: 60, ideal: 80)
 
                 TableColumn("Updated") { tag in
                     Text(tag.timestamp, style: .time)
                         .font(HMIStyle.metaFont).foregroundColor(.secondary)
+                        .lineLimit(1)
                 }
-                .width(70)
+                .width(min: 55, ideal: 70)
             }
             .onChange(of: sortOrder) { _, _ in }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -384,6 +388,30 @@ struct MonitorView: View {
                                      content: Text(desc).font(HMIStyle.fieldLabelFont))
                         }
 
+                        // Digital tag: show editable on/off label fields
+                        if tag.dataType == .digital {
+                            DigitalLabelEditor(tagName: tag.name)
+                        }
+
+                        // Composite tag: show member list
+                        if tag.dataType == .composite,
+                           let members = tag.compositeMembers,
+                           let aggregation = tag.compositeAggregation {
+                            valueRow("COMPOSITE (\(aggregation.displayName.uppercased()))",
+                                content: VStack(alignment: .leading, spacing: 2) {
+                                    ForEach(members) { m in
+                                        HStack(spacing: 6) {
+                                            Text(m.alias.isEmpty ? m.tagName : m.alias)
+                                                .font(HMIStyle.metaFont).foregroundColor(.secondary)
+                                                .frame(width: 80, alignment: .leading)
+                                            Text(m.tagName)
+                                                .font(.system(size: 11, design: .monospaced))
+                                                .foregroundColor(.blue)
+                                        }
+                                    }
+                                })
+                        }
+
                         if let config = alarmManager.alarmConfigs.first(where: { $0.tagName == tag.name }) {
                             VStack(alignment: .leading, spacing: HMIStyle.spacingXS) {
                                 HStack(spacing: 5) {
@@ -409,7 +437,8 @@ struct MonitorView: View {
 
                     // Actions
                     VStack(spacing: 8) {
-                        if sessionManager.canWrite && tag.dataType != .calculated && tag.dataType != .totalizer {
+                        if sessionManager.canWrite && tag.dataType != .calculated
+            && tag.dataType != .totalizer && tag.dataType != .composite {
                             Button {
                                 showWriteSheet = true
                             } label: {
@@ -523,6 +552,65 @@ struct MonitorView: View {
         switch opcuaService.connectionState {
         case .connected: return .green; case .connecting: return .yellow
         case .disconnected: return .gray; case .error: return .red
+        }
+    }
+}
+
+// MARK: - DigitalLabelEditor
+// Inline editor for a digital tag's custom on/off label strings.
+// Changes are committed on Return or focus-loss; saved directly to TagEngine.tags.
+
+private struct DigitalLabelEditor: View {
+    @EnvironmentObject var tagEngine: TagEngine
+    let tagName: String
+
+    @State private var onText:  String = ""
+    @State private var offText: String = ""
+
+    private var tag: Tag? { tagEngine.tags[tagName] }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("STATUS LABELS")
+                .font(HMIStyle.fieldLabelFont)
+                .foregroundColor(.secondary)
+                .textCase(.uppercase)
+                .tracking(0.4)
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("ON label").font(.caption2).foregroundColor(.secondary)
+                    TextField("e.g. Running", text: $onText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(HMIStyle.fieldLabelFont)
+                        .onSubmit { commit() }
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("OFF label").font(.caption2).foregroundColor(.secondary)
+                    TextField("e.g. Stopped", text: $offText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(HMIStyle.fieldLabelFont)
+                        .onSubmit { commit() }
+                }
+            }
+        }
+        .onAppear  { load() }
+        .onChange(of: tagName) { _, _ in load() }
+    }
+
+    private func load() {
+        onText  = tag?.onLabel  ?? ""
+        offText = tag?.offLabel ?? ""
+    }
+
+    private func commit() {
+        guard var t = tagEngine.tags[tagName] else { return }
+        t.onLabel  = onText.trimmingCharacters(in: .whitespaces).isEmpty
+            ? nil : onText.trimmingCharacters(in: .whitespaces)
+        t.offLabel = offText.trimmingCharacters(in: .whitespaces).isEmpty
+            ? nil : offText.trimmingCharacters(in: .whitespaces)
+        tagEngine.tags[tagName] = t
+        if let h = tagEngine.historian {
+            Task { try? await h.saveTagConfig(t) }
         }
     }
 }

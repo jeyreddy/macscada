@@ -179,15 +179,18 @@ struct AlarmListView: View {
                         Text(alarm.severity.rawValue)
                             .font(HMIStyle.fieldLabelFont.bold())
                             .foregroundColor(HMIStyle.severityColor(alarm.severity))
+                            .lineLimit(1)
                     }
                 }
-                .width(90)
+                .width(min: 70, ideal: 90)
 
                 // Tag
                 TableColumn("Tag", value: \.tagName) { alarm in
                     VStack(alignment: .leading, spacing: 2) {
                         Text(alarm.tagName)
                             .font(HMIStyle.tagNameFont)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
                         // Occurrence count badge
                         let count = occurrenceCount(alarm)
                         if count > 1 {
@@ -197,24 +200,28 @@ struct AlarmListView: View {
                         }
                     }
                 }
-                .width(min: 140)
+                .width(min: 100, ideal: 150)
 
                 // Message
                 TableColumn("Message") { alarm in
-                    Text(alarm.message).font(HMIStyle.fieldLabelFont).lineLimit(2)
+                    Text(alarm.message)
+                        .font(HMIStyle.fieldLabelFont)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
-                .width(min: 180)
+                .width(min: 130)
 
                 // Value at trigger
                 TableColumn("Value") { alarm in
                     if let v = alarm.value {
                         Text(String(format: "%.2f", v))
                             .font(HMIStyle.alarmValueFont)
+                            .lineLimit(1)
                     } else {
                         Text("—").foregroundColor(.secondary).font(HMIStyle.fieldLabelFont)
                     }
                 }
-                .width(70)
+                .width(min: 55, ideal: 70)
 
                 // Trigger time
                 TableColumn("Triggered", value: \.triggerTime) { alarm in
@@ -224,29 +231,30 @@ struct AlarmListView: View {
                             .font(HMIStyle.metaFont).foregroundColor(.secondary)
                     }
                 }
-                .width(90)
+                .width(min: 70, ideal: 90)
 
                 // State
                 TableColumn("State", value: \.state.rawValue) { alarm in
                     Text(alarm.state.rawValue)
                         .font(HMIStyle.fieldLabelFont.bold())
                         .foregroundColor(HMIStyle.alarmStateColor(alarm.state))
+                        .lineLimit(1)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
                         .background(HMIStyle.alarmStateColor(alarm.state).opacity(0.12))
                         .cornerRadius(4)
                 }
-                .width(110)
+                .width(min: 90, ideal: 110)
 
                 // Acknowledged by
                 TableColumn("Ack By") { alarm in
                     if let by = alarm.acknowledgedBy {
-                        Text(by).font(HMIStyle.fieldLabelFont).foregroundColor(.secondary)
+                        Text(by).font(HMIStyle.fieldLabelFont).foregroundColor(.secondary).lineLimit(1)
                     } else {
                         Text("—").font(HMIStyle.fieldLabelFont).foregroundColor(.secondary)
                     }
                 }
-                .width(80)
+                .width(min: 60, ideal: 80)
 
                 // Action
                 TableColumn("") { alarm in
@@ -260,7 +268,7 @@ struct AlarmListView: View {
                         .tint(alarm.state == .unacknowledgedRTN ? .green : .orange)
                     }
                 }
-                .width(50)
+                .width(min: 44, ideal: 50)
             }
         }
     }

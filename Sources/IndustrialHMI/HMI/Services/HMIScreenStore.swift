@@ -189,6 +189,23 @@ class HMIScreenStore: ObservableObject {
         screen.modifiedAt = Date()
     }
 
+    /// Adds an object to a specific screen by ID.
+    /// If the target is the current screen, updates in-memory state directly.
+    /// Otherwise loads the screen file, appends the object, and saves it back to disk.
+    func addObjectToScreen(id: UUID, _ obj: HMIObject) {
+        if id == currentScreenId {
+            addObject(obj)
+            return
+        }
+        let fileURL = screensDir.appendingPathComponent("\(id.uuidString).json")
+        guard var targetScreen = loadScreen(id: id) else { return }
+        targetScreen.objects.append(obj)
+        targetScreen.modifiedAt = Date()
+        if let data = try? JSONEncoder().encode(targetScreen) {
+            try? data.write(to: fileURL, options: .atomic)
+        }
+    }
+
     func updateObject(_ obj: HMIObject) {
         guard let idx = screen.objects.firstIndex(where: { $0.id == obj.id }) else { return }
         screen.objects[idx] = obj
