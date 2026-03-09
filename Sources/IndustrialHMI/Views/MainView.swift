@@ -116,11 +116,6 @@ struct MainView: View {
                     .opacity(selectedTab == .hmi ? 1 : 0)
                     .allowsHitTesting(selectedTab == .hmi)
 
-                AgentView()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .opacity(selectedTab == .agent ? 1 : 0)
-                    .allowsHitTesting(selectedTab == .agent)
-
                 ProcessCanvasView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .opacity(selectedTab == .canvas ? 1 : 0)
@@ -135,7 +130,8 @@ struct MainView: View {
                     case .settings:  SettingsView()
                     case .auditLog:  AuditLogView()
                     case .community: CommunitySettingsView()
-                    case .monitor, .trends, .hmi, .agent, .canvas:
+                    case .agent:     AgentView()
+                    case .monitor, .trends, .hmi, .canvas:
                         Color.clear
                     }
                 }
