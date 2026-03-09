@@ -150,6 +150,9 @@ struct MainView: View {
                 }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .navigateToTab)) { note in
+            if let tab = note.object as? Tab { selectedTab = tab }
+        }
         .onChange(of: selectedTab) { old, new in
             diagLog("DIAG [MainView] tab changed: \(old.rawValue) → \(new.rawValue)")
             sessionManager.recordActivity()

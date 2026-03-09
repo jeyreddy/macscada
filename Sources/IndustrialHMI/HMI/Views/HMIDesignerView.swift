@@ -133,9 +133,9 @@ struct HMIDesignerView: View {
                 .focused($canvasFocused)
                 .onAppear { canvasFocused = true }
                 .onTapGesture { canvasFocused = true }
-                // ── Keyboard shortcuts (edit mode only) ──────────────────────
-                .onKeyPress(.delete)        { deleteSelected() }
-                .onKeyPress(.deleteForward) { deleteSelected() }
+                // ── Keyboard shortcuts (canvas focused, edit mode) ───────────
+                // Delete is handled via the HMI Editor menu command (notification)
+                // so it fires even when the inspector panel has focus.
                 .onKeyPress(.escape) {
                     guard isEditMode else { return .ignored }
                     if activeTool != nil { activeTool = nil; return .handled }
@@ -146,6 +146,10 @@ struct HMIDesignerView: View {
                 .onKeyPress(.rightArrow) { nudgeSelected(dx:  1, dy:  0) }
                 .onKeyPress(.upArrow)    { nudgeSelected(dx:  0, dy: -1) }
                 .onKeyPress(.downArrow)  { nudgeSelected(dx:  0, dy:  1) }
+                // ── Delete via menu command (bypasses focus) ─────────────────
+                .onReceive(NotificationCenter.default.publisher(for: .hmiDeleteSelected)) { _ in
+                    deleteSelected()
+                }
 
                 // ── Alarm Ribbon ──────────────────────────────────────────────
                 alarmRibbon

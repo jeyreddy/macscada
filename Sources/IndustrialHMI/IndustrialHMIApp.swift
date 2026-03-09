@@ -35,6 +35,15 @@
 
 import SwiftUI
 
+// MARK: - App-wide Notification Names
+
+extension Notification.Name {
+    /// Navigate to a sidebar tab. Post with object: Tab (the target tab).
+    static let navigateToTab     = Notification.Name("hmi.navigateToTab")
+    /// Delete the currently selected HMI object (edit mode).
+    static let hmiDeleteSelected = Notification.Name("hmi.deleteSelected")
+}
+
 // Diagnostic helper — writes to both stdout and /tmp/hmi_diag.log.
 // No-ops when Configuration.verboseLogging is false.
 let diagLogURL = URL(fileURLWithPath: "/tmp/hmi_diag.log")
@@ -178,7 +187,7 @@ struct IndustrialHMIApp: App {
         }
         .windowToolbarStyle(.unified)
         .commands {
-            // Custom menu commands
+            // ── About ──────────────────────────────────────────────────────
             CommandGroup(replacing: .appInfo) {
                 Button("About Industrial HMI") {
                     NSApp.orderFrontStandardAboutPanel(
@@ -190,6 +199,25 @@ struct IndustrialHMIApp: App {
                         ]
                     )
                 }
+            }
+
+            // ── Navigate menu — Cmd+1…5 and Cmd+, ────────────────────────
+            CommandMenu("Navigate") {
+                Button("Monitor")        { post(.monitor)  }.keyboardShortcut("1", modifiers: .command)
+                Button("Trends")         { post(.trends)   }.keyboardShortcut("2", modifiers: .command)
+                Button("Alarms")         { post(.alarms)   }.keyboardShortcut("3", modifiers: .command)
+                Button("HMI Screens")    { post(.hmi)      }.keyboardShortcut("4", modifiers: .command)
+                Button("Process Canvas") { post(.canvas)   }.keyboardShortcut("5", modifiers: .command)
+                Divider()
+                Button("Settings")       { post(.settings) }.keyboardShortcut(",", modifiers: .command)
+            }
+
+            // ── HMI Editor menu ───────────────────────────────────────────
+            CommandMenu("HMI Editor") {
+                Button("Delete Selected Object") {
+                    NotificationCenter.default.post(name: .hmiDeleteSelected, object: nil)
+                }
+                .keyboardShortcut(.delete, modifiers: [])
             }
         }
     }
@@ -213,6 +241,11 @@ struct IndustrialHMIApp: App {
         NSWindow.allowsAutomaticWindowTabbing = false
     }
     
+    /// Posts a tab-navigation notification from within Commands (no environment access there).
+    private func post(_ tab: Tab) {
+        NotificationCenter.default.post(name: .navigateToTab, object: tab)
+    }
+
     private func getArchitecture() -> String {
         #if arch(arm64)
         return "Apple Silicon (ARM64)"
