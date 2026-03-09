@@ -90,7 +90,12 @@ struct ProcessCanvasView: View {
                 CanvasScrollCapture(
                     onPan:       { dx, dy in pan.x += dx; pan.y += dy },
                     onZoom:      { factor, pt in applyZoom(factor: factor, at: pt) },
-                    onMouseMove: { loc in mouseLocation = loc; viewSize = geo.size }
+                    onMouseMove: { loc in mouseLocation = loc; viewSize = geo.size },
+                    onKeyPan:    { dx, dy in
+                        withAnimation(.interactiveSpring()) { pan.x += dx; pan.y += dy }
+                    },
+                    onKeyZoom:   { factor in applyZoom(factor: factor, at: viewCenter) },
+                    onFit:       { fitToWindow(size: geo.size) }
                 )
                 .onAppear {
                     viewSize = geo.size
@@ -578,18 +583,21 @@ struct CanvasGridView: View {
 
 /// SwiftUI wrapper for `_CanvasNSView` — forwards scroll, pinch, and mouse events.
 struct CanvasScrollCapture: NSViewRepresentable {
-    /// Called with (deltaX, deltaY) in screen points whenever a scroll event fires.
     var onPan:       (CGFloat, CGFloat) -> Void
-    /// Called with (zoomFactor, screenPoint) on trackpad pinch or Ctrl/⌘+scroll.
     var onZoom:      (CGFloat, CGPoint) -> Void
-    /// Called with the current cursor position whenever the mouse moves over the canvas.
     var onMouseMove: (CGPoint) -> Void
+    var onKeyPan:    (CGFloat, CGFloat) -> Void
+    var onKeyZoom:   (CGFloat) -> Void
+    var onFit:       () -> Void
 
     func makeNSView(context: Context) -> _CanvasNSView {
         let v = _CanvasNSView()
         v.onPan       = onPan
         v.onZoom      = onZoom
         v.onMouseMove = onMouseMove
+        v.onKeyPan    = onKeyPan
+        v.onKeyZoom   = onKeyZoom
+        v.onFit       = onFit
         return v
     }
 
@@ -597,15 +605,21 @@ struct CanvasScrollCapture: NSViewRepresentable {
         v.onPan       = onPan
         v.onZoom      = onZoom
         v.onMouseMove = onMouseMove
+        v.onKeyPan    = onKeyPan
+        v.onKeyZoom   = onKeyZoom
+        v.onFit       = onFit
     }
 }
 
-/// Raw NSView that captures scroll wheel, magnification, and mouse-move events.
+/// Raw NSView that captures scroll wheel, magnification, mouse-move, and keyboard events.
 /// Named with underscore prefix to indicate it is an internal implementation detail.
 final class _CanvasNSView: NSView {
     var onPan:       ((CGFloat, CGFloat) -> Void)?
     var onZoom:      ((CGFloat, CGPoint) -> Void)?
     var onMouseMove: ((CGPoint) -> Void)?
+    var onKeyPan:    ((CGFloat, CGFloat) -> Void)?   // keyboard arrow pan (dx, dy)
+    var onKeyZoom:   ((CGFloat) -> Void)?            // keyboard zoom factor
+    var onFit:       (() -> Void)?                   // fit to window (key 0)
 
     /// Match SwiftUI's coordinate system (Y increases downward).
     override var isFlipped: Bool { true }
@@ -613,11 +627,40 @@ final class _CanvasNSView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        // Track mouse movement so edge-auto-pan can read cursor position.
         let opts: NSTrackingArea.Options = [
             .mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect
         ]
         addTrackingArea(NSTrackingArea(rect: .zero, options: opts, owner: self, userInfo: nil))
+    }
+
+    // Become first responder on click so keyboard events are received.
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
+    }
+
+    // MARK: - Keyboard navigation
+    //
+    //   Arrow keys          — pan 20 pt (Shift = 100 pt)
+    //   = / + / Cmd+=       — zoom in  ×1.25
+    //   - / Cmd+-           — zoom out ×0.8
+    //   0 / Cmd+0           — fit to window
+    //   All other keys      — passed to super (system shortcuts, etc.)
+
+    override func keyDown(with event: NSEvent) {
+        let shift    = event.modifierFlags.contains(.shift)
+        let step: CGFloat = shift ? 100 : 20
+
+        switch event.keyCode {
+        case 123: onKeyPan?( step,     0)     // ← left arrow  → pan canvas right
+        case 124: onKeyPan?(-step,     0)     // → right arrow → pan canvas left
+        case 126: onKeyPan?(0,         step)  // ↑ up arrow    → pan canvas down
+        case 125: onKeyPan?(0,        -step)  // ↓ down arrow  → pan canvas up
+        case 24, 69:  onKeyZoom?(1.25)        // = / numpad+   → zoom in
+        case 27:      onKeyZoom?(0.8)         // -             → zoom out
+        case 29:      onFit?()               // 0             → fit to window
+        default:  super.keyDown(with: event)
+        }
     }
 
     override func scrollWheel(with event: NSEvent) {

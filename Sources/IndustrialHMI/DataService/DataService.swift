@@ -95,8 +95,8 @@ class DataService: ObservableObject {
         let engine = TagEngine()
         let alarms = AlarmManager()
 
-        // Wire historian from TagEngine into AlarmManager so both share the same DB.
-        alarms.historian = engine.historian
+        // NOTE: engine.historian is nil here — Historian uses async init.
+        // Historian wiring is deferred to engine.onHistorianReady (set below).
 
         self.opcuaService   = opcua
         self.tagEngine      = engine
@@ -112,7 +112,6 @@ class DataService: ObservableObject {
             opcuaService:   opcua)
         self.sessionManager = SessionManager()
         let recipes         = RecipeStore(tagEngine: engine, opcuaService: opcua)
-        recipes.historian   = engine.historian
         self.recipeStore    = recipes
 
         // Phase 13: Community federation service (must be before any [weak self] closure)
@@ -120,7 +119,6 @@ class DataService: ObservableObject {
 
         // Phase 15: Scheduler
         let scheduler = SchedulerService(tagEngine: engine, opcuaService: opcua)
-        scheduler.historian  = engine.historian
         self.schedulerService = scheduler
 
         // Phase 16: 3D scene store
@@ -151,10 +149,19 @@ class DataService: ObservableObject {
 
         Logger.shared.info("DataService initialized with \(self.driverInstances.count) default drivers")
 
-        // Restore alarm configs, history, recipes, and scheduled jobs from SQLite
-        Task { await alarms.loadFromDB() }
-        Task { await recipes.loadFromDB() }
-        Task { await scheduler.loadFromDB() }
+        // Deferred historian wiring: fires once TagEngine's async Historian init completes.
+        // This is the correct place to wire historian into services that need it,
+        // because engine.historian is nil until the async Task in TagEngine.init() finishes.
+        engine.onHistorianReady = { [weak alarms, weak recipes, weak scheduler] h in
+            alarms?.historian    = h
+            recipes?.historian   = h
+            scheduler?.historian = h
+            Task {
+                await alarms?.loadFromDB()
+                await recipes?.loadFromDB()
+                await scheduler?.loadFromDB()
+            }
+        }
 
         // Phase 16: When the active HMI screen changes, load its paired 3D scene.
         // Using a local reference to avoid [weak self] capture issues in init.

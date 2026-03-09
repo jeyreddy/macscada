@@ -79,6 +79,11 @@ class TagEngine: ObservableObject {
     var historian: Historian?          // internal — AlarmManager borrows this reference
     private var simulationTimer: Timer?
 
+    /// Called on @MainActor once the Historian finishes async init.
+    /// DataService uses this to wire historian into AlarmManager/RecipeStore/Scheduler
+    /// and trigger their loadFromDB() — ensuring they run after the DB is ready.
+    var onHistorianReady: ((Historian) -> Void)?
+
     // MARK: - Expression Dependency Graph
 
     /// calcTag → set of tag names it reads from.
@@ -129,6 +134,7 @@ class TagEngine: ObservableObject {
                 let h = try await Historian()
                 self.historian = h
                 Logger.shared.info("Tag engine initialized with historian")
+                self.onHistorianReady?(h)   // wire AlarmManager/Recipes/Scheduler
                 await self.loadPersistedTags(historian: h)
             } catch {
                 Logger.shared.error("Failed to initialize historian: \(error)")

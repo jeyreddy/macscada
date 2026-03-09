@@ -87,7 +87,10 @@ struct CompositeHMIView: View {
                 CanvasScrollCapture(
                     onPan:       { dx, dy in pan.x += dx; pan.y += dy },
                     onZoom:      { factor, pt in applyZoom(factor: factor, at: pt) },
-                    onMouseMove: { _ in }   // edge auto-pan not needed in read-only composite
+                    onMouseMove: { _ in },
+                    onKeyPan:    { dx, dy in pan.x += dx; pan.y += dy },
+                    onKeyZoom:   { factor in applyZoom(factor: factor, at: CGPoint(x: geo.size.width/2, y: geo.size.height/2)) },
+                    onFit:       { fitAll(size: geo.size) }
                 )
                 .onAppear {
                     viewSize = geo.size
