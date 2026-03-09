@@ -56,6 +56,8 @@ struct HMIDesignerView: View {
     @State private var selectedObjectId: UUID? = nil
     @State private var faceplateObjectId: UUID? = nil     // run-mode tap
 
+    @FocusState private var canvasFocused: Bool
+
     var body: some View {
         Group {
             switch displayMode {
@@ -127,6 +129,23 @@ struct HMIDesignerView: View {
                 }
                 .animation(.easeInOut(duration: 0.18), value: isEditMode && selectedObjectId != nil)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .focusable()
+                .focused($canvasFocused)
+                .onAppear { canvasFocused = true }
+                .onTapGesture { canvasFocused = true }
+                // ── Keyboard shortcuts (edit mode only) ──────────────────────
+                .onKeyPress(.delete)        { deleteSelected() }
+                .onKeyPress(.deleteForward) { deleteSelected() }
+                .onKeyPress(.escape) {
+                    guard isEditMode else { return .ignored }
+                    if activeTool != nil { activeTool = nil; return .handled }
+                    if selectedObjectId != nil { selectedObjectId = nil; return .handled }
+                    return .ignored
+                }
+                .onKeyPress(.leftArrow)  { nudgeSelected(dx: -1, dy:  0) }
+                .onKeyPress(.rightArrow) { nudgeSelected(dx:  1, dy:  0) }
+                .onKeyPress(.upArrow)    { nudgeSelected(dx:  0, dy: -1) }
+                .onKeyPress(.downArrow)  { nudgeSelected(dx:  0, dy:  1) }
 
                 // ── Alarm Ribbon ──────────────────────────────────────────────
                 alarmRibbon
@@ -211,6 +230,28 @@ struct HMIDesignerView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    // MARK: - Keyboard Actions
+
+    @discardableResult
+    private func deleteSelected() -> KeyPress.Result {
+        guard isEditMode, let id = selectedObjectId else { return .ignored }
+        hmiScreenStore.deleteObject(id: id)
+        selectedObjectId = nil
+        return .handled
+    }
+
+    @discardableResult
+    private func nudgeSelected(dx: Double, dy: Double) -> KeyPress.Result {
+        guard isEditMode, let id = selectedObjectId,
+              let obj = hmiScreenStore.screen.objects.first(where: { $0.id == id })
+        else { return .ignored }
+        var updated = obj
+        updated.x += dx
+        updated.y += dy
+        hmiScreenStore.updateObject(updated)
+        return .handled
     }
 
     private func toolButton(icon: String, label: String, active: Bool, action: @escaping () -> Void) -> some View {
