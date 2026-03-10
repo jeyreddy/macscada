@@ -89,6 +89,11 @@ struct Tag: Identifiable, Codable, Equatable {
     /// Aggregation function applied to composite members (nil for non-composite tags).
     var compositeAggregation: CompositeAggregation?
 
+    /// When false the historian will NOT record values for this tag.
+    /// Use to exclude high-frequency or diagnostic tags from long-term storage.
+    /// Defaults to true — all tags are historian-logged unless explicitly opted out.
+    var historianEnabled: Bool = true
+
     // MARK: - Initialization
 
     init(
@@ -105,7 +110,8 @@ struct Tag: Identifiable, Codable, Equatable {
         onLabel: String? = nil,
         offLabel: String? = nil,
         compositeMembers: [CompositeMember]? = nil,
-        compositeAggregation: CompositeAggregation? = nil
+        compositeAggregation: CompositeAggregation? = nil,
+        historianEnabled: Bool = true
     ) {
         self.id = id
         self.name = name
@@ -121,6 +127,7 @@ struct Tag: Identifiable, Codable, Equatable {
         self.offLabel = offLabel
         self.compositeMembers = compositeMembers
         self.compositeAggregation = compositeAggregation
+        self.historianEnabled = historianEnabled
     }
     
     // MARK: - Computed Properties

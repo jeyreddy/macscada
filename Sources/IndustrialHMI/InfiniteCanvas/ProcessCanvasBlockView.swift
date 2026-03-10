@@ -1,82 +1,101 @@
 import SwiftUI
+import AppKit
 
 // MARK: - ProcessCanvasBlockView
 //
 // Renders one CanvasBlock on the infinite canvas.
 //
-// ── Coordinate math ──────────────────────────────────────────────────────────
-//   Canvas space  →  screen space conversion (same as ProcessCanvasView):
-//     sx = block.x * scale + pan.x        (screen X of top-left corner)
-//     sy = block.y * scale + pan.y        (screen Y of top-left corner)
-//     sw = block.w * scale                (screen width)
-//     sh = block.h * scale                (screen height)
-//   SwiftUI .position() takes the *centre*, so we pass (sx + sw/2, sy + sh/2).
+// ── UX features ────────────────────────────────────────────────────────────
+//   • Pulsing alarm border  — blocks with active alarms get an animated border
+//   • Alarm badge dot       — visible at ALL zoom levels (even below 0.12)
+//   • Double-click zoom     — double-tap any block to zoom into it
+//   • Hover glow + cursor   — interactive blocks show pointer cursor on hover
+//   • Right-click menu      — Zoom / Open Screen / Navigate
+//   • Medium-zoom "big number" — key value shown large at 0.12–0.25 zoom
+//   • Region block          — labelled coloured area with no live data
 //
-// ── Level of Detail (LOD) ─────────────────────────────────────────────────────
-//   scale < 0.12  →  nothing inside the block is shown (just the coloured box)
-//   scale < 0.25  →  compact summary: icon + single-line summary text
-//   scale ≥ 0.25  →  full content view (TagMonitorContent, EquipmentContent, …)
+// ── Level of Detail (LOD) ────────────────────────────────────────────────
+//   scale < 0.12  →  alarm badge only (just the coloured box + badge dot)
+//   scale < 0.25  →  medium zoom: big value / running state / alarm count
+//   scale ≥ 0.25  →  full content view
 //
-//   These thresholds were chosen so that at the default fit-to-window scale
-//   (~0.3–0.6 for a typical 4-block canvas), full content is always visible.
-//
-// ── Design vs Operate mode ────────────────────────────────────────────────────
-//   Operate mode:
-//     • Content (buttons, scroll views) handles its own taps.
-//     • .onTapGesture on the outer ZStack handles block-level tap actions
-//       (navButton, hmiScreen, screenGroup).
-//
-//   Design mode:
-//     • Content VStack has .allowsHitTesting(false) so buttons/ScrollViews inside
-//       blocks don't consume taps intended for block selection.
-//     • A Color.clear overlay with .contentShape(Rectangle()) sits on top and
-//       routes all taps to onSelect() and all drags to blockDragGesture.
-//     • Selection handles (filled circles at the four corners) are drawn topmost
-//       with .allowsHitTesting(false) so they don't interfere with drag.
+// ── Design vs Operate mode ───────────────────────────────────────────────
+//   Operate: content handles taps; outer ZStack catches navButton / hmiScreen / screenGroup.
+//   Design:  Color.clear overlay routes all taps → onSelect(), drags → onDragEnd.
 
 struct ProcessCanvasBlockView: View {
 
     let block:       CanvasBlock
-    /// Current canvas zoom level — used for LOD switching and screen geometry.
     let scale:       CGFloat
-    /// Pan offset (screen position of the canvas origin).
     let pan:         CGPoint
-    /// Whether this block is currently selected in design mode.
     let isSelected:  Bool
-    /// True when the toolbar is in Design mode.
     let isDesigning: Bool
 
     // MARK: - Operate-mode callbacks
-
-    /// navButton: animate viewport to (navX, navY) at navScale.
     let onNavigate:        (Double, Double, Double) -> Void
-    /// hmiScreen: switch HMI tab to this screen ID string.
-    var onOpenScreen:      (String) -> Void = { _ in }
-    /// screenGroup: open CompositeHMIView with the given entries, columns, and title.
+    var onOpenScreen:      (String) -> Void            = { _ in }
     var onOpenScreenGroup: ([ScreenGroupEntry], Int, String) -> Void = { _, _, _ in }
+    var onZoomTo:          () -> Void                  = {}   // double-click → zoom
 
     // MARK: - Design-mode callbacks
+    var onSelect:    () -> Void          = {}
+    var onDragEnd:   (CGPoint) -> Void   = { _ in }
 
-    /// Called when the block is tapped to select it.
-    var onSelect:    () -> Void   = {}
-    /// Called when a drag ends. Parameter is the new canvas-space top-left corner.
-    var onDragEnd:   (CGPoint) -> Void = { _ in }
+    // MARK: - Live data (for alarm state + medium-zoom values)
+    @EnvironmentObject var tagEngine:    TagEngine
+    @EnvironmentObject var alarmManager: AlarmManager
 
     // MARK: - Drag state
+    @State private var dragOffset: CGPoint = .zero
+    @State private var isDragging: Bool    = false
 
-    /// Screen-space drag translation while the block is being dragged.
-    /// Reset to .zero when the drag ends so the block snaps to its persisted position.
-    @State private var dragOffset:    CGPoint = .zero
-    @State private var isDragging:    Bool    = false
+    // MARK: - Interaction state
+    @State private var isHovered:   Bool = false
+    @State private var alarmPulse:  Bool = false
 
     // MARK: - Computed screen geometry
 
-    /// Screen X of the block's top-left corner (including drag offset).
     private var sx: CGFloat { block.x * scale + pan.x + dragOffset.x }
     private var sy: CGFloat { block.y * scale + pan.y + dragOffset.y }
-    /// Screen width and height of the block.
     private var sw: CGFloat { block.w * scale }
     private var sh: CGFloat { block.h * scale }
+
+    // MARK: - Alarm state
+
+    enum AlarmBlockState { case none, warning, critical }
+
+    private var blockAlarmState: AlarmBlockState {
+        switch block.content.kind {
+        case "alarmPanel":
+            if alarmManager.activeAlarms.contains(where: {
+                $0.severity == .critical && $0.state.requiresAction }) { return .critical }
+            if !alarmManager.activeAlarms.isEmpty { return .warning }
+            return .none
+        case "equipment":
+            let alarms = alarmManager.getAlarms(forTag: block.content.equipTagID)
+            if alarms.contains(where: { $0.severity == .critical }) { return .critical }
+            if !alarms.isEmpty { return .warning }
+            return .none
+        case "tagMonitor", "statusGrid", "trendMini":
+            let all = block.content.tagIDs.flatMap { alarmManager.getAlarms(forTag: $0) }
+            if all.contains(where: { $0.severity == .critical }) { return .critical }
+            if !all.isEmpty { return .warning }
+            return .none
+        default:
+            return .none
+        }
+    }
+
+    private var hasAlarm: Bool { blockAlarmState != .none }
+
+    private var alarmColor: Color {
+        blockAlarmState == .critical ? .red : .orange
+    }
+
+    // MARK: - Interactive (cursor + hover glow)
+    private var isInteractive: Bool {
+        ["navButton", "hmiScreen", "screenGroup"].contains(block.content.kind)
+    }
 
     // MARK: - Body
 
@@ -84,7 +103,6 @@ struct ProcessCanvasBlockView: View {
         ZStack(alignment: .topLeading) {
             blockBody
                 .frame(width: max(sw, 4), height: max(sh, 4))
-                // SwiftUI .position() anchors at the view centre.
                 .position(x: sx + sw / 2, y: sy + sh / 2)
         }
     }
@@ -99,36 +117,39 @@ struct ProcessCanvasBlockView: View {
             RoundedRectangle(cornerRadius: clampedCorner)
                 .fill(Color(hex: block.bgHex))
 
-            // ── Border stroke (thicker + accent-coloured when selected) ───
+            // ── Hover glow (interactive blocks only) ──────────────────────
+            if isHovered && isInteractive && !isDesigning {
+                RoundedRectangle(cornerRadius: clampedCorner)
+                    .fill(Color.white.opacity(0.06))
+            }
+
+            // ── Border: pulsing alarm / selected / default ─────────────────
             RoundedRectangle(cornerRadius: clampedCorner)
                 .strokeBorder(
-                    isSelected ? Color.accentColor : Color(hex: block.borderHex),
-                    lineWidth: isSelected ? 2 : 1
+                    isSelected
+                        ? Color.accentColor
+                        : (hasAlarm
+                            ? alarmColor.opacity(alarmPulse ? 1.0 : 0.35)
+                            : Color(hex: block.borderHex)),
+                    lineWidth: isSelected ? 2 : (hasAlarm ? 2 : 1)
                 )
 
-            // ── Content (title bar + main content view) ───────────────────
-            // .allowsHitTesting(!isDesigning) prevents the buttons and ScrollViews
-            // inside blocks from absorbing taps in design mode — taps are handled
-            // by the Color.clear overlay below instead.
+            // ── Content (title + LOD view) ────────────────────────────────
             VStack(alignment: .leading, spacing: 0) {
-                // Title bar — hidden at very small zoom (scale < 0.12)
                 if block.showTitle && scale > 0.12 {
                     titleBar
                 }
-                // LOD-based content selection
                 if scale >= 0.25 {
-                    blockContent    // full content (tag tables, gauges, etc.)
+                    blockContent
                 } else if scale >= 0.12 {
-                    compactSummary  // icon + one-line description
+                    mediumZoomContent  // big number / running state
                 }
-                // Below 0.12: nothing shown inside (block is tiny)
+                // Below 0.12 → only alarm badge shows
             }
             .clipShape(RoundedRectangle(cornerRadius: clampedCorner))
             .allowsHitTesting(!isDesigning)
 
-            // ── Design-mode tap + drag overlay ────────────────────────────
-            // Sits above the content layer but below selection handles.
-            // Color.clear with contentShape makes the full block area hittable.
+            // ── Design-mode overlay ────────────────────────────────────────
             if isDesigning {
                 Color.clear
                     .contentShape(Rectangle())
@@ -136,43 +157,102 @@ struct ProcessCanvasBlockView: View {
                     .gesture(blockDragGesture)
             }
 
-            // ── Selection handles (four corner dots) ──────────────────────
-            // Topmost so they render above everything else.
-            // Non-interactive (.allowsHitTesting(false)) — they are visual only.
+            // ── Selection handles ──────────────────────────────────────────
             if isDesigning && isSelected {
                 selectionHandles.allowsHitTesting(false)
             }
+
+            // ── Alarm badge dot — visible at ALL zoom levels ──────────────
+            if hasAlarm {
+                let dotSize: CGFloat = max(8, min(14, sw * 0.06))
+                Circle()
+                    .fill(alarmColor)
+                    .frame(width: dotSize, height: dotSize)
+                    .overlay(Circle().stroke(Color.black.opacity(0.5), lineWidth: 0.5))
+                    .shadow(color: alarmColor.opacity(0.9), radius: alarmPulse ? 5 : 2)
+                    .scaleEffect(alarmPulse ? 1.3 : 0.95)
+                    .position(x: max(sw - dotSize / 2 - 4, dotSize / 2 + 2), y: dotSize / 2 + 4)
+                    .allowsHitTesting(false)
+            }
         }
-        // Operate-mode tap actions — fires only when isDesigning is false because
-        // the design-mode overlay's .onTapGesture would fire first otherwise.
-        .onTapGesture {
+        // ── Operate-mode taps ─────────────────────────────────────────────
+        // Double-tap first so SwiftUI's recognizer doesn't treat it as two single taps.
+        .onTapGesture(count: 2) {
+            guard !isDesigning else { return }
+            onZoomTo()
+        }
+        .onTapGesture(count: 1) {
             guard !isDesigning else { return }
             switch block.content.kind {
             case "navButton":
-                // Animate the Process Canvas viewport to the stored target.
                 onNavigate(block.content.navX, block.content.navY, block.content.navScale)
             case "hmiScreen":
-                // Switch to HMI tab and load the linked screen.
                 onOpenScreen(block.content.hmiScreenID)
             case "screenGroup":
-                // Open the full-screen composite view with all linked screens.
                 onOpenScreenGroup(block.content.screenGroupEntries,
                                   block.content.screenGroupCols,
                                   block.title)
-            default:
-                break
+            default: break
             }
+        }
+        // ── Right-click context menu ──────────────────────────────────────
+        .contextMenu {
+            Button { onZoomTo() } label: {
+                Label("Zoom to Block", systemImage: "magnifyingglass")
+            }
+            if block.content.kind == "navButton" {
+                Button { onNavigate(block.content.navX, block.content.navY, block.content.navScale) } label: {
+                    Label("Navigate Here", systemImage: "arrow.right.circle")
+                }
+            }
+            if block.content.kind == "hmiScreen" {
+                Button { onOpenScreen(block.content.hmiScreenID) } label: {
+                    Label("Open Screen", systemImage: "rectangle.on.rectangle")
+                }
+            }
+            if block.content.kind == "screenGroup" {
+                Button {
+                    onOpenScreenGroup(block.content.screenGroupEntries,
+                                      block.content.screenGroupCols,
+                                      block.title)
+                } label: {
+                    Label("Open Combined View", systemImage: "square.grid.2x2")
+                }
+            }
+        }
+        // ── Hover tracking ─────────────────────────────────────────────────
+        .onHover { hovering in
+            isHovered = hovering
+            guard !isDesigning && isInteractive else { return }
+            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+        // ── Alarm pulse animation ─────────────────────────────────────────
+        .onAppear {
+            if hasAlarm { startPulse() }
+        }
+        .onChange(of: hasAlarm) { _, alarming in
+            if alarming { startPulse() } else { stopPulse() }
         }
     }
 
-    /// Corner radius clamped to 4 % of the block's screen width so very small blocks
-    /// don't have a radius larger than their dimensions.
+    private func startPulse() {
+        withAnimation(.easeInOut(duration: 0.75).repeatForever(autoreverses: true)) {
+            alarmPulse = true
+        }
+    }
+
+    private func stopPulse() {
+        withAnimation(.easeInOut(duration: 0.3)) {
+            alarmPulse = false
+        }
+    }
+
+    // MARK: - Corner radius
+
     private var clampedCorner: CGFloat { min(8, sw * 0.04) }
 
     // MARK: - Title bar
 
-    /// Compact single-line header shown at the top of the block.
-    /// Font size scales with `scale` but is clamped so it stays legible.
     private var titleBar: some View {
         HStack(spacing: 4) {
             Image(systemName: contentIcon)
@@ -183,79 +263,92 @@ struct ProcessCanvasBlockView: View {
                 .lineLimit(1)
                 .foregroundColor(.white.opacity(0.85))
             Spacer()
+            // Alarm count badge in title bar (visible at full zoom)
+            if hasAlarm {
+                let count = alarmCountForBlock
+                Text("\(count)")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(alarmColor, in: Capsule())
+            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
         .background(Color.white.opacity(0.06))
     }
 
-    // MARK: - Content (full zoom: scale ≥ 0.25)
+    private var alarmCountForBlock: Int {
+        switch block.content.kind {
+        case "alarmPanel":       return alarmManager.activeAlarms.count
+        case "equipment":        return alarmManager.getAlarms(forTag: block.content.equipTagID).count
+        default:                 return block.content.tagIDs.flatMap { alarmManager.getAlarms(forTag: $0) }.count
+        }
+    }
+
+    // MARK: - Medium zoom content (0.12 ≤ scale < 0.25)
+    // Shows the operationally most important value large enough to read across the room.
 
     @ViewBuilder
-    private var blockContent: some View {
-        Group {
+    private var mediumZoomContent: some View {
+        VStack(spacing: 3) {
             switch block.content.kind {
-            case "label":
-                // Static text label — no live data, just displays block.content.text.
-                LabelContent(text: block.content.text, fontSize: block.content.fontSize * scale)
-
-            case "tagMonitor":
-                // Scrollable table: tag name | formatted value | quality dot.
-                TagMonitorContent(tagIDs: block.content.tagIDs)
-
-            case "statusGrid":
-                // Coloured tile grid: green=running, orange=alarm, red=bad quality.
-                StatusGridContent(tagIDs: block.content.tagIDs)
-
-            case "alarmPanel":
-                // ISA-18.2 active alarm list, capped at maxAlarms rows.
-                AlarmPanelContent(maxAlarms: block.content.maxAlarms)
-
-            case "navButton":
-                // Tappable button that animates the viewport (operate mode tap handled above).
-                NavButtonContent(label: block.content.navLabel) {
-                    onNavigate(block.content.navX, block.content.navY, block.content.navScale)
+            case "tagMonitor", "statusGrid":
+                if let id = block.content.tagIDs.first, let tag = tagEngine.tags[id] {
+                    Text(tag.formattedValue)
+                        .font(.system(size: clamp(scale * 64, lo: 14, hi: 28),
+                                      weight: .bold, design: .monospaced))
+                        .foregroundColor(tag.quality == .bad ? .red : .white)
+                        .lineLimit(1)
+                    Text(tag.name)
+                        .font(.system(size: clamp(scale * 28, lo: 8, hi: 12)))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                } else {
+                    compactSummary
                 }
-
             case "equipment":
-                // Industrial equipment icon with running/alarm/stopped colour from a tag.
-                EquipmentContent(kind: block.content.equipKind, tagID: block.content.equipTagID)
-
+                let tag  = block.content.equipTagID.isEmpty ? nil : tagEngine.tags[block.content.equipTagID]
+                let running = tag.map { isTagRunning($0) } ?? false
+                Image(systemName: contentIcon)
+                    .font(.system(size: clamp(scale * 80, lo: 18, hi: 32)))
+                    .foregroundColor(hasAlarm ? .orange : (running ? .green : .secondary))
+                Text(running ? "RUN" : "STOP")
+                    .font(.system(size: clamp(scale * 28, lo: 9, hi: 13), weight: .bold))
+                    .foregroundColor(running ? .green : .secondary)
+            case "alarmPanel":
+                let count = alarmManager.activeAlarms.count
+                Text("\(count)")
+                    .font(.system(size: clamp(scale * 80, lo: 18, hi: 36),
+                                  weight: .heavy, design: .monospaced))
+                    .foregroundColor(count == 0 ? .green : .red)
+                Text("ALARMS")
+                    .font(.system(size: clamp(scale * 22, lo: 8, hi: 11), weight: .semibold))
+                    .foregroundColor(.secondary)
             case "trendMini":
-                // Mini sparklines for up to 3 tags.
-                TrendMiniContent(tagIDs: block.content.tagIDs, minutes: block.content.minutes)
-
-            case "hmiScreen":
-                // Button-style card showing the linked HMI screen name.
-                HMIScreenContent(
-                    screenID:   block.content.hmiScreenID,
-                    screenName: block.content.hmiScreenName
-                ) {
-                    onOpenScreen(block.content.hmiScreenID)
+                if let id = block.content.tagIDs.first, let tag = tagEngine.tags[id] {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chart.xyaxis.line")
+                            .font(.system(size: 12)).foregroundColor(.secondary)
+                        Text(tag.formattedValue)
+                            .font(.system(size: clamp(scale * 52, lo: 13, hi: 22),
+                                          weight: .bold, design: .monospaced))
+                            .foregroundColor(.white)
+                    }
+                } else {
+                    compactSummary
                 }
-
-            case "screenGroup":
-                // Mini grid preview; tap opens CompositeHMIView.
-                ScreenGroupContent(
-                    entries: block.content.screenGroupEntries,
-                    cols:    block.content.screenGroupCols,
-                    title:   block.title
-                ) {
-                    onOpenScreenGroup(block.content.screenGroupEntries,
-                                      block.content.screenGroupCols,
-                                      block.title)
-                }
-
             default:
-                EmptyView()
+                compactSummary
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(4)
     }
 
-    // MARK: - Compact summary (medium zoom: 0.12 ≤ scale < 0.25)
+    // MARK: - Compact summary (fallback for medium zoom)
 
-    /// Shown when the block is too small for full content but large enough for a single line.
     private var compactSummary: some View {
         HStack {
             Image(systemName: contentIcon)
@@ -270,9 +363,54 @@ struct ProcessCanvasBlockView: View {
         .padding(.vertical, 4)
     }
 
+    // MARK: - Full content (scale ≥ 0.25)
+
+    @ViewBuilder
+    private var blockContent: some View {
+        Group {
+            switch block.content.kind {
+            case "label":
+                LabelContent(text: block.content.text, fontSize: block.content.fontSize * scale)
+            case "tagMonitor":
+                TagMonitorContent(tagIDs: block.content.tagIDs)
+            case "statusGrid":
+                StatusGridContent(tagIDs: block.content.tagIDs)
+            case "alarmPanel":
+                AlarmPanelContent(maxAlarms: block.content.maxAlarms)
+            case "navButton":
+                NavButtonContent(label: block.content.navLabel) {
+                    onNavigate(block.content.navX, block.content.navY, block.content.navScale)
+                }
+            case "equipment":
+                EquipmentContent(kind: block.content.equipKind, tagID: block.content.equipTagID)
+            case "trendMini":
+                TrendMiniContent(tagIDs: block.content.tagIDs, minutes: block.content.minutes)
+            case "hmiScreen":
+                HMIScreenContent(
+                    screenID:   block.content.hmiScreenID,
+                    screenName: block.content.hmiScreenName
+                ) { onOpenScreen(block.content.hmiScreenID) }
+            case "screenGroup":
+                ScreenGroupContent(
+                    entries: block.content.screenGroupEntries,
+                    cols:    block.content.screenGroupCols,
+                    title:   block.title
+                ) {
+                    onOpenScreenGroup(block.content.screenGroupEntries,
+                                      block.content.screenGroupCols,
+                                      block.title)
+                }
+            case "region":
+                RegionContent(text: block.content.text, colorHex: block.content.regionColorHex)
+            default:
+                EmptyView()
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
     // MARK: - Selection handles
 
-    /// Four small filled circles at the block corners — visual feedback for selection.
     private var selectionHandles: some View {
         ZStack {
             ForEach([CGPoint(x: 0, y: 0),
@@ -282,7 +420,6 @@ struct ProcessCanvasBlockView: View {
                 Circle()
                     .fill(Color.accentColor)
                     .frame(width: 8, height: 8)
-                    // corner.x/y are normalised (0 or 1) — multiply by screen dimensions.
                     .position(x: corner.x * sw, y: corner.y * sh)
             }
         }
@@ -290,28 +427,29 @@ struct ProcessCanvasBlockView: View {
 
     // MARK: - Drag gesture (design mode)
 
-    /// Moves the block by accumulating the drag translation as a screen-space offset.
-    /// On gesture end, converts the offset to canvas-space coordinates and calls onDragEnd.
     private var blockDragGesture: some Gesture {
         DragGesture(minimumDistance: 3)
             .onChanged { v in
                 isDragging = true
-                // Store raw screen-space translation for live visual feedback.
                 dragOffset = CGPoint(x: v.translation.width, y: v.translation.height)
             }
             .onEnded { v in
                 isDragging = false
-                // Convert screen-space delta to canvas-space delta by dividing by scale.
                 let newCanvasX = block.x + v.translation.width  / scale
                 let newCanvasY = block.y + v.translation.height / scale
-                dragOffset = .zero  // reset so the block snaps to its new persisted position
+                dragOffset = .zero
                 onDragEnd(CGPoint(x: newCanvasX, y: newCanvasY))
             }
     }
 
-    // MARK: - Content metadata helpers
+    // MARK: - Helpers
 
-    /// SF Symbol icon for the block's content kind (used in title bar and compact summary).
+    private func isTagRunning(_ tag: Tag) -> Bool {
+        if case .digital(let b) = tag.value { return b }
+        if case .analog(let v)  = tag.value { return v > 0 }
+        return false
+    }
+
     private var contentIcon: String {
         switch block.content.kind {
         case "label":       return "text.alignleft"
@@ -319,15 +457,24 @@ struct ProcessCanvasBlockView: View {
         case "statusGrid":  return "square.grid.2x2"
         case "alarmPanel":  return "exclamationmark.triangle"
         case "navButton":   return "arrow.right.circle"
-        case "equipment":   return "gearshape"
+        case "equipment":
+            switch block.content.equipKind {
+            case "pump":       return "drop.circle.fill"
+            case "motor":      return "bolt.circle.fill"
+            case "valve":      return "flowchart.fill"
+            case "tank":       return "cylinder.fill"
+            case "exchanger":  return "arrow.triangle.2.circlepath"
+            case "compressor": return "wind"
+            default:           return "gearshape.fill"
+            }
         case "trendMini":   return "chart.xyaxis.line"
         case "hmiScreen":   return "rectangle.on.rectangle"
         case "screenGroup": return "square.grid.2x2"
+        case "region":      return "rectangle.dashed"
         default:            return "square"
         }
     }
 
-    /// Single-line description shown in the compact summary view.
     private var summaryText: String {
         switch block.content.kind {
         case "tagMonitor":  return "\(block.content.tagIDs.count) tags"
@@ -345,7 +492,6 @@ struct ProcessCanvasBlockView: View {
 
 // MARK: - Clamp helper
 
-/// Constrain `v` to the range [lo, hi].
 private func clamp(_ v: CGFloat, lo: CGFloat, hi: CGFloat) -> CGFloat {
     max(lo, min(hi, v))
 }

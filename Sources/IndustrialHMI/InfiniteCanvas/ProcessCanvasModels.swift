@@ -73,6 +73,7 @@ struct CanvasBlock: Identifiable, Codable {
 //   "trendMini"   — tagIDs, minutes (sparklines for up to 3 tags)
 //   "hmiScreen"   — hmiScreenID, hmiScreenName (link to a screen in the HMI tab)
 //   "screenGroup" — screenGroupEntries, screenGroupCols (multi-screen composite view)
+//   "region"      — text, regionColorHex (labelled translucent area for plant grouping)
 
 /// Content descriptor for a CanvasBlock.
 /// Only the fields relevant to the active `kind` are used; others are ignored.
@@ -124,6 +125,10 @@ struct BlockContent: Codable {
     /// Number of grid columns in the composite layout. Rows = ceil(count / cols).
     var screenGroupCols:    Int = 2
 
+    // MARK: region
+    /// Hex colour for the translucent region background.
+    var regionColorHex: String = "#1D4ED8"
+
     // MARK: - Factory methods (convenience constructors)
     //
     // Use these instead of the memberwise init to avoid forgetting required fields.
@@ -171,6 +176,11 @@ struct BlockContent: Codable {
     /// Multi-screen group — tapping opens CompositeHMIView with all screens in a grid.
     static func screenGroup(cols: Int = 2) -> BlockContent {
         BlockContent(kind: "screenGroup", screenGroupCols: cols)
+    }
+
+    /// Translucent labelled area block for visual plant-area grouping (no live data).
+    static func region(_ label: String, colorHex: String = "#1D4ED8") -> BlockContent {
+        BlockContent(kind: "region", text: label, regionColorHex: colorHex)
     }
 }
 

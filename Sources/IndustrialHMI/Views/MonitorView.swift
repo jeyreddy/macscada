@@ -394,6 +394,35 @@ struct MonitorView: View {
                         valueRow("LAST UPDATED",
                                  content: Text(tag.timestamp, style: .time).font(HMIStyle.fieldLabelFont))
 
+                        // Historian opt-in toggle
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("LOG TO HISTORIAN")
+                                    .font(HMIStyle.fieldLabelFont)
+                                    .foregroundColor(.secondary)
+                                    .textCase(.uppercase)
+                                    .tracking(0.4)
+                                Text(tag.historianEnabled
+                                     ? "Values stored for trending & history"
+                                     : "Values not stored — live view only")
+                                    .font(.caption2)
+                                    .foregroundColor(tag.historianEnabled ? .secondary : .orange)
+                            }
+                            Spacer()
+                            Toggle("", isOn: Binding(
+                                get: { tag.historianEnabled },
+                                set: { enabled in
+                                    guard var t = tagEngine.tags[tag.name] else { return }
+                                    t.historianEnabled = enabled
+                                    tagEngine.tags[tag.name] = t
+                                    if let h = tagEngine.historian {
+                                        Task { try? await h.saveTagConfig(t) }
+                                    }
+                                }
+                            ))
+                            .labelsHidden()
+                        }
+
                         if let desc = tag.description, !desc.isEmpty {
                             valueRow("DESCRIPTION",
                                      content: Text(desc).font(HMIStyle.fieldLabelFont))

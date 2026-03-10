@@ -618,6 +618,11 @@ struct AddBlockSheet: View {
         ("square.grid.2x2", "Screen Group",  "Multiple HMI screens as one seamless display",
          { CanvasBlock(title: "Screen Group", w: 340, h: 220, bgHex: "#0A1628", borderHex: "#1D4ED8",
                        content: .screenGroup(cols: 2)) }),
+
+        ("rectangle.dashed", "Region",       "Labelled area background for plant grouping",
+         { CanvasBlock(title: "Region", showTitle: false, w: 600, h: 400,
+                       bgHex: "#0D1E3A", borderHex: "#1D4ED8",
+                       content: .region("Area Name", colorHex: "#1D4ED8")) }),
     ]}
 
     var body: some View {

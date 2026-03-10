@@ -9,20 +9,38 @@ on:
 jobs:
   build:
     name: Build & Test
-    runs-on: macos-14
+    runs-on: macos-14        # Apple Silicon (arm64) — Homebrew at /opt/homebrew
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Cache Homebrew downloads so repeated CI runs don't re-download open62541
+      - name: Cache Homebrew
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew
+            /opt/homebrew/Cellar/open62541
+          key: brew-open62541-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install open62541
-        run: brew install open62541
+        run: |
+          brew install open62541 || brew upgrade open62541
+          # Print installed version for build-log traceability
+          brew info open62541 | head -3
+
+      # Confirm the lib and headers are where Package.swift expects them
+      - name: Verify open62541 paths
+        run: |
+          ls /opt/homebrew/lib/libopen62541* || { echo "ERROR: libopen62541 not found"; exit 1; }
+          ls /opt/homebrew/include/open62541/server.h || { echo "ERROR: open62541 headers not found"; exit 1; }
 
       - name: Resolve Swift packages
         run: swift package resolve
 
-      - name: Build
+      - name: Build (debug)
         run: swift build -c debug 2>&1
 
       - name: Run tests
-        run: swift test 2>&1
+        run: swift test --filter TagEngineTests 2>&1

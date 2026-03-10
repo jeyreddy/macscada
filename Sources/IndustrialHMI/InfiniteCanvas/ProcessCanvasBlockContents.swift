@@ -67,9 +67,17 @@ private struct TagMonitorRow: View {
     /// Resolves the tag from TagEngine using the stored name key.
     var tag: Tag? { tagEngine.tags[tagID] }
 
+    // Flash state — briefly brightens when the value changes.
+    @State private var flashBright: Bool = false
+
+    // Stale threshold: dim value if tag hasn't updated in 30 seconds.
+    private var isStale: Bool {
+        guard let t = tag else { return false }
+        return Date().timeIntervalSince(t.timestamp) > 30
+    }
+
     var body: some View {
         HStack {
-            // Tag name + optional unit on a second micro-line
             VStack(alignment: .leading, spacing: 1) {
                 Text(tag?.name ?? tagID).font(.caption2).lineLimit(1)
                 if let unit = tag?.unit, !unit.isEmpty {
@@ -78,25 +86,26 @@ private struct TagMonitorRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            // Formatted value (monospaced for stable column width)
+            // Value — flashes white on change, dims when stale
             Text(tag?.formattedValue ?? "—")
                 .font(.system(size: 12, weight: .medium, design: .monospaced))
-                .foregroundColor(valueColor)
+                .foregroundColor(flashBright ? .white : valueColor)
+                .opacity(isStale ? 0.45 : 1.0)
                 .frame(width: 70, alignment: .trailing)
+                .onChange(of: tag?.formattedValue) { _, _ in
+                    flashBright = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { flashBright = false }
+                }
 
-            // Quality indicator dot
+            // Quality dot — gray when stale
             Circle()
-                .fill(tag?.quality.dot ?? .secondary)
+                .fill(isStale ? Color.gray : (tag?.quality.dot ?? .secondary))
                 .frame(width: 8)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
     }
 
-    /// Value text colour:
-    ///   red   = bad quality
-    ///   green = digital tag that is ON
-    ///   white = analog value (good quality)
     private var valueColor: Color {
         guard let t = tag else { return .secondary }
         if t.quality == .bad { return .red }
@@ -143,24 +152,31 @@ private struct StatusTile: View {
 
     var tag: Tag? { tagEngine.tags[tagID] }
 
+    private var isStale: Bool {
+        guard let t = tag else { return false }
+        return Date().timeIntervalSince(t.timestamp) > 30
+    }
+
     var body: some View {
         VStack(spacing: 3) {
-            Circle().fill(tileColor).frame(width: 10, height: 10)
+            Circle().fill(isStale ? Color.gray : tileColor).frame(width: 10, height: 10)
             Text(tag?.name ?? tagID)
                 .font(.system(size: 10, weight: .medium))
                 .lineLimit(2)
                 .multilineTextAlignment(.center)
             Text(tag?.formattedValue ?? "—")
                 .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .opacity(isStale ? 0.45 : 1.0)
         }
         .padding(8)
         .frame(maxWidth: .infinity)
-        .background(tileColor.opacity(0.12))
-        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(tileColor.opacity(0.4), lineWidth: 1))
+        .background((isStale ? Color.gray : tileColor).opacity(0.12))
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder((isStale ? Color.gray : tileColor).opacity(0.4), lineWidth: 1))
         .cornerRadius(6)
     }
 
     /// Tile background and indicator colour — see colour priority table in section header.
+    /// Stale tiles are rendered gray regardless of alarm/quality state.
     private var tileColor: Color {
         guard let t = tag else { return .secondary }
         if !alarmManager.getAlarms(forTag: t.name).isEmpty { return .orange }
@@ -300,26 +316,43 @@ struct NavButtonContent: View {
 //   gray   = stopped or no tag bound
 
 /// Industrial equipment icon with live running/alarm/stopped status.
+/// Pumps, motors, and compressors rotate continuously when running.
+/// Exchangers spin when running. Valves blink when in-transition.
 struct EquipmentContent: View {
-    /// One of: "pump" | "motor" | "valve" | "tank" | "exchanger" | "compressor"
     let kind:  String
-    /// Tag name used to determine running state. Empty string = no tag (static icon).
     let tagID: String
-    @EnvironmentObject var tagEngine:   TagEngine
+    @EnvironmentObject var tagEngine:    TagEngine
     @EnvironmentObject var alarmManager: AlarmManager
+
+    @State private var rotationDeg: Double = 0
+    @State private var valveBlink:  Bool   = false
 
     private var tag: Tag? { tagEngine.tags[tagID] }
 
-    /// Equipment is "running" when the bound tag has a non-zero/true value.
     private var isRunning: Bool {
         if let t = tag, case .digital(let b) = t.value { return b }
         if let t = tag, case .analog(let v)  = t.value { return v > 0 }
         return false
     }
 
-    /// True when the bound tag has at least one active alarm.
     private var hasAlarm: Bool {
         tag.map { !alarmManager.getAlarms(forTag: $0.name).isEmpty } ?? false
+    }
+
+    private var isStale: Bool {
+        guard let t = tag else { return false }
+        return Date().timeIntervalSince(t.timestamp) > 30
+    }
+
+    // How fast each equipment type rotates (seconds per full revolution). nil = no rotation.
+    private var rotationPeriod: Double? {
+        switch kind {
+        case "pump":       return 2.0
+        case "motor":      return 1.2
+        case "compressor": return 1.8
+        case "exchanger":  return 3.0
+        default:           return nil
+        }
     }
 
     var body: some View {
@@ -327,6 +360,10 @@ struct EquipmentContent: View {
             Image(systemName: icon)
                 .font(.system(size: 36))
                 .foregroundColor(hasAlarm ? .orange : (isRunning ? .green : .secondary))
+                // Rotation animation for rotating equipment
+                .rotationEffect(.degrees(rotationPeriod != nil && isRunning ? rotationDeg : 0))
+                // Valve blinking when alarm is active
+                .opacity(kind == "valve" && hasAlarm ? (valveBlink ? 1.0 : 0.3) : 1.0)
 
             Text(kind.capitalized)
                 .font(.caption.bold())
@@ -334,20 +371,42 @@ struct EquipmentContent: View {
             if let t = tag {
                 Text(t.formattedValue)
                     .font(.system(size: 13, weight: .medium, design: .monospaced))
+                    .opacity(isStale ? 0.45 : 1.0)
                 HStack(spacing: 4) {
-                    Circle().fill(t.quality.dot).frame(width: 6)
-                    Text(isRunning ? "Running" : "Stopped")
+                    Circle().fill(isStale ? Color.gray : t.quality.dot).frame(width: 6)
+                    Text(isStale ? "Stale" : (isRunning ? "Running" : "Stopped"))
                         .font(.caption2)
-                        .foregroundColor(isRunning ? .green : .secondary)
+                        .foregroundColor(isStale ? .secondary : (isRunning ? .green : .secondary))
                 }
             } else if !tagID.isEmpty {
                 Text("No data").font(.caption2).foregroundColor(.secondary)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear { updateAnimations() }
+        .onChange(of: isRunning) { _, _ in updateAnimations() }
+        .onChange(of: hasAlarm)  { _, _ in updateAnimations() }
     }
 
-    /// SF Symbol name for each equipment kind.
+    private func updateAnimations() {
+        // Rotate running equipment
+        if let period = rotationPeriod, isRunning {
+            withAnimation(.linear(duration: period).repeatForever(autoreverses: false)) {
+                rotationDeg = 360
+            }
+        } else {
+            withAnimation(.easeOut(duration: 0.4)) { rotationDeg = 0 }
+        }
+        // Blink valve on alarm
+        if kind == "valve" && hasAlarm {
+            withAnimation(.easeInOut(duration: 0.5).repeatForever(autoreverses: true)) {
+                valveBlink = true
+            }
+        } else {
+            withAnimation(.easeOut(duration: 0.2)) { valveBlink = false }
+        }
+    }
+
     private var icon: String {
         switch kind {
         case "pump":       return "drop.circle.fill"
@@ -582,5 +641,41 @@ private struct MiniSparkline: View {
         }
 
         await MainActor.run { sparkPoints = normalised }
+    }
+}
+
+// MARK: - Region Content
+//
+// A translucent labelled background block used for visual plant-area grouping.
+// Has no live data — purely structural / decorative.
+// The block's bgHex is used for the background fill; regionColorHex drives the
+// border and title text accent so the area colour is prominent.
+
+/// Labelled translucent area block for grouping canvas regions by plant area.
+struct RegionContent: View {
+    /// Area label text (e.g. "Reactor Section", "Feed System").
+    let text:     String
+    /// Hex colour driving the border and label accent (e.g. "#1D4ED8").
+    let colorHex: String
+
+    var body: some View {
+        ZStack(alignment: .center) {
+            // Accent border overlay (the block background handles the fill)
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color(hex: colorHex).opacity(0.5), lineWidth: 2)
+                .padding(2)
+
+            // Centred area label
+            if !text.isEmpty {
+                Text(text)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(Color(hex: colorHex).opacity(0.7))
+                    .multilineTextAlignment(.center)
+                    .padding(12)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Region blocks are purely visual — do not intercept taps.
+        .allowsHitTesting(false)
     }
 }

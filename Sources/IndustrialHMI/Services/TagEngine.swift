@@ -449,7 +449,7 @@ class TagEngine: ObservableObject {
         updated.quality   = .good
         updated.timestamp = Date()
         tags[name] = updated
-        if let num = result.numericValue, historian != nil {
+        if let num = result.numericValue, historian != nil, tag.historianEnabled {
             historianBatch.append((tagName: name, value: num, timestamp: updated.timestamp))
         }
         onTagUpdated?(updated)
@@ -538,7 +538,7 @@ class TagEngine: ObservableObject {
         tags[name] = tag
 
         // ── Batch historian write ──────────────────────────────────────────────
-        if quality == .good, let num = value.numericValue, historian != nil {
+        if quality == .good, let num = value.numericValue, historian != nil, tag.historianEnabled {
             historianBatch.append((tagName: name, value: num, timestamp: timestamp))
             if historianBatch.count >= Configuration.historianBatchSize {
                 flushHistorianBatch()   // flush immediately when batch is full

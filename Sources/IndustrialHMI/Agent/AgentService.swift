@@ -110,6 +110,9 @@ class AgentService: ObservableObject {
     /// Injected by DataService after init — executes OPC-UA write + historian log.
     var confirmWrite: ((WriteRequest) async throws -> Void)?
 
+    /// Injected by DataService after init — gives the agent full Process Canvas CRUD access.
+    var canvasStore: ProcessCanvasStore?
+
     // MARK: - Conversation (rolling window, 40 messages max)
 
     private var conversationHistory: [APIMessage] = []
@@ -346,6 +349,15 @@ class AgentService: ObservableObject {
             case "write_tag_values":           return try await toolWriteTagValues(input: input)
             case "list_all_screens":           return try    toolListAllScreens()
             case "create_hmi_screen":          return try    toolCreateHMIScreen(input: input)
+            // Process Canvas tools
+            case "list_canvases":              return try    toolListCanvases()
+            case "create_canvas":              return try    toolCreateCanvas(input: input)
+            case "switch_canvas":              return try    toolSwitchCanvas(input: input)
+            case "list_canvas_blocks":         return try    toolListCanvasBlocks()
+            case "add_canvas_block":           return try    toolAddCanvasBlock(input: input)
+            case "update_canvas_block":        return try    toolUpdateCanvasBlock(input: input)
+            case "delete_canvas_block":        return try    toolDeleteCanvasBlock(input: input)
+            case "arrange_canvas_grid":        return try    toolArrangeCanvasGrid(input: input)
             default:
                 return err("Unknown tool: \(name)")
             }
@@ -679,6 +691,309 @@ class AgentService: ObservableObject {
         let name = strArg(input, "name") ?? "New Screen"
         hmiScreenStore.createScreen(name: name)
         return ok(["created": name], "HMI screen '\(name)' created and switched to it.")
+    }
+
+    // MARK: - Process Canvas Tools
+
+    private func requireCanvas() throws -> ProcessCanvasStore {
+        guard let cs = canvasStore else { throw AgentError.missingParameter("canvas store not available") }
+        return cs
+    }
+
+    private func canvasBlockToDict(_ b: CanvasBlock) -> [String: Any] {
+        var d: [String: Any] = [
+            "id":         b.id.uuidString,
+            "title":      b.title,
+            "kind":       b.content.kind,
+            "x": b.x, "y": b.y, "w": b.w, "h": b.h,
+            "bg_hex":     b.bgHex,
+            "border_hex": b.borderHex,
+            "show_title": b.showTitle
+        ]
+        switch b.content.kind {
+        case "tagMonitor", "statusGrid":
+            d["tag_ids"] = b.content.tagIDs
+        case "trendMini":
+            d["tag_ids"] = b.content.tagIDs
+            d["minutes"] = b.content.minutes
+        case "alarmPanel":
+            d["max_alarms"] = b.content.maxAlarms
+        case "equipment":
+            d["equip_kind"]   = b.content.equipKind
+            d["equip_tag_id"] = b.content.equipTagID
+        case "navButton":
+            d["nav_label"] = b.content.navLabel
+            d["nav_x"]     = b.content.navX
+            d["nav_y"]     = b.content.navY
+            d["nav_scale"] = b.content.navScale
+        case "hmiScreen":
+            d["hmi_screen_id"]   = b.content.hmiScreenID
+            d["hmi_screen_name"] = b.content.hmiScreenName
+        case "label":
+            d["text"]      = b.content.text
+            d["font_size"] = b.content.fontSize
+        case "region":
+            d["text"]             = b.content.text
+            d["region_color_hex"] = b.content.regionColorHex
+        default: break
+        }
+        return d
+    }
+
+    private func toolListCanvases() throws -> ToolResult {
+        let cs = try requireCanvas()
+        let list: [[String: Any]] = cs.canvases.map { c in
+            ["id":          c.id.uuidString,
+             "name":        c.name,
+             "block_count": c.blocks.count,
+             "is_active":   c.id == cs.activeID]
+        }
+        return ok(["canvases": list, "count": list.count,
+                   "active": cs.active?.name ?? "none"],
+                  "\(list.count) canvas(es); active: '\(cs.active?.name ?? "none")'")
+    }
+
+    private func toolCreateCanvas(input: [String: AnyCodable]) throws -> ToolResult {
+        let cs   = try requireCanvas()
+        let name = strArg(input, "name") ?? "New Canvas"
+        cs.newCanvas(name: name)
+        return ok(["created": name, "id": cs.activeID?.uuidString ?? ""],
+                  "Canvas '\(name)' created and activated.")
+    }
+
+    private func toolSwitchCanvas(input: [String: AnyCodable]) throws -> ToolResult {
+        let cs   = try requireCanvas()
+        guard let name = strArg(input, "name") else { throw AgentError.missingParameter("name") }
+        guard let target = cs.canvases.first(where: {
+            $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
+        }) else {
+            let available = cs.canvases.map(\.name).joined(separator: ", ")
+            return err("Canvas '\(name)' not found. Available: \(available)")
+        }
+        cs.activeID = target.id
+        return ok(["switched_to": target.name, "block_count": target.blocks.count],
+                  "Switched to canvas '\(target.name)' (\(target.blocks.count) blocks).")
+    }
+
+    private func toolListCanvasBlocks() throws -> ToolResult {
+        let cs = try requireCanvas()
+        guard let canvas = cs.active else { return err("No active canvas.") }
+        let blocks = canvas.blocks.map { canvasBlockToDict($0) }
+        return ok(["canvas": canvas.name, "blocks": blocks, "count": blocks.count],
+                  "\(blocks.count) block(s) on canvas '\(canvas.name)'")
+    }
+
+    private func toolAddCanvasBlock(input: [String: AnyCodable]) throws -> ToolResult {
+        let cs   = try requireCanvas()
+        guard cs.active != nil else { return err("No active canvas.") }
+        guard let kind = strArg(input, "kind") else { throw AgentError.missingParameter("kind") }
+
+        let title  = strArg(input, "title") ?? kind
+        let x      = dblArg(input, "x") ?? 100
+        let y      = dblArg(input, "y") ?? 100
+        let bgHex  = strArg(input, "bg_hex") ?? "#161B22"
+        let borHex = strArg(input, "border_hex") ?? "#30363D"
+
+        // Default sizes per block kind
+        let (defaultW, defaultH): (Double, Double) = {
+            switch kind {
+            case "label":      return (260, 80)
+            case "region":     return (500, 350)
+            case "alarmPanel": return (420, 200)
+            case "navButton":  return (220, 70)
+            case "equipment":  return (200, 200)
+            case "trendMini":  return (380, 180)
+            default:           return (320, 220)
+            }
+        }()
+        let w = dblArg(input, "w") ?? defaultW
+        let h = dblArg(input, "h") ?? defaultH
+
+        // Build BlockContent from kind + kind-specific args
+        let tagIDsRaw = input["tag_ids"]?.value as? [Any] ?? []
+        let tagIDs = tagIDsRaw.compactMap { $0 as? String }
+
+        let content: BlockContent
+        switch kind {
+        case "tagMonitor":
+            content = .tagMonitor(tagIDs)
+        case "statusGrid":
+            content = .statusGrid(tagIDs)
+        case "alarmPanel":
+            content = .alarmPanel(max: (input["max_alarms"]?.value as? Int) ?? 5)
+        case "equipment":
+            let ek    = strArg(input, "equip_kind") ?? "pump"
+            let etID  = strArg(input, "equip_tag_id") ?? ""
+            content   = .equipment(ek, tagID: etID)
+        case "trendMini":
+            let mins  = (input["minutes"]?.value as? Int) ?? 30
+            content   = .trendMini(tagIDs, minutes: mins)
+        case "navButton":
+            let lbl   = strArg(input, "nav_label") ?? "Navigate →"
+            let nx    = dblArg(input, "nav_x") ?? 0
+            let ny    = dblArg(input, "nav_y") ?? 0
+            let ns    = dblArg(input, "nav_scale") ?? 1.0
+            content   = .navButton(label: lbl, x: nx, y: ny, scale: ns)
+        case "region":
+            let txt   = strArg(input, "text") ?? title
+            let col   = strArg(input, "region_color_hex") ?? "#1D4ED8"
+            content   = .region(txt, colorHex: col)
+        case "label":
+            let txt   = strArg(input, "text") ?? title
+            let fs    = dblArg(input, "font_size") ?? 28
+            content   = .label(txt, size: fs)
+        case "hmiScreen":
+            let sid   = strArg(input, "hmi_screen_id") ?? ""
+            let sname = strArg(input, "hmi_screen_name") ?? ""
+            if let uuid = UUID(uuidString: sid) {
+                content = .hmiScreen(id: uuid, name: sname)
+            } else {
+                // Try to find screen by name
+                if let meta = hmiScreenStore.allScreenMeta.first(where: {
+                    $0.name.localizedCaseInsensitiveCompare(sname) == .orderedSame
+                }) {
+                    content = .hmiScreen(id: meta.id, name: meta.name)
+                } else {
+                    return err("HMI screen '\(sname)' not found. Use list_all_screens to get IDs.")
+                }
+            }
+        case "screenGroup":
+            content = .screenGroup(cols: (input["cols"]?.value as? Int) ?? 2)
+        default:
+            return err("Unknown block kind '\(kind)'. Valid: label, tagMonitor, statusGrid, alarmPanel, equipment, trendMini, navButton, hmiScreen, screenGroup, region")
+        }
+
+        let block = CanvasBlock(title: title, showTitle: true,
+                                x: x, y: y, w: w, h: h,
+                                bgHex: bgHex, borderHex: borHex,
+                                content: content)
+        cs.addBlock(block)
+        return ok(canvasBlockToDict(block),
+                  "Added '\(title)' (\(kind)) block at (\(Int(x)),\(Int(y))) on canvas '\(cs.active?.name ?? "")'")
+    }
+
+    private func toolUpdateCanvasBlock(input: [String: AnyCodable]) throws -> ToolResult {
+        let cs = try requireCanvas()
+        guard var canvas = cs.active else { return err("No active canvas.") }
+
+        // Find block by ID or title
+        var block: CanvasBlock?
+        if let idStr = strArg(input, "block_id"), let uuid = UUID(uuidString: idStr) {
+            block = canvas.blocks.first { $0.id == uuid }
+        }
+        if block == nil, let title = strArg(input, "block_title") {
+            block = canvas.blocks.first { $0.title.localizedCaseInsensitiveCompare(title) == .orderedSame }
+        }
+        guard var b = block else {
+            let titles = canvas.blocks.map(\.title).joined(separator: ", ")
+            return err("Block not found. Available: \(titles)")
+        }
+
+        // Apply updates
+        if let v = strArg(input, "title")      { b.title     = v }
+        if let v = dblArg(input, "x")          { b.x         = v }
+        if let v = dblArg(input, "y")          { b.y         = v }
+        if let v = dblArg(input, "w")          { b.w         = v }
+        if let v = dblArg(input, "h")          { b.h         = v }
+        if let v = strArg(input, "bg_hex")     { b.bgHex     = v }
+        if let v = strArg(input, "border_hex") { b.borderHex = v }
+        if let v = input["show_title"]?.value as? Bool { b.showTitle = v }
+
+        // Content updates
+        if let tagIDsRaw = input["tag_ids"]?.value as? [Any] {
+            b.content.tagIDs = tagIDsRaw.compactMap { $0 as? String }
+        }
+        if let v = strArg(input, "equip_kind")   { b.content.equipKind   = v }
+        if let v = strArg(input, "equip_tag_id") { b.content.equipTagID  = v }
+        if let v = strArg(input, "nav_label")    { b.content.navLabel    = v }
+        if let v = dblArg(input, "nav_x")        { b.content.navX        = v }
+        if let v = dblArg(input, "nav_y")        { b.content.navY        = v }
+        if let v = dblArg(input, "nav_scale")    { b.content.navScale    = v }
+        if let v = strArg(input, "text")         { b.content.text        = v }
+        if let v = dblArg(input, "font_size")    { b.content.fontSize    = v }
+        if let v = strArg(input, "region_color_hex") { b.content.regionColorHex = v }
+        if let v = input["max_alarms"]?.value as? Int { b.content.maxAlarms = v }
+        if let v = input["minutes"]?.value as? Int    { b.content.minutes    = v }
+
+        cs.updateBlock(b)
+        return ok(canvasBlockToDict(b), "Updated block '\(b.title)' on canvas '\(canvas.name)'")
+    }
+
+    private func toolDeleteCanvasBlock(input: [String: AnyCodable]) throws -> ToolResult {
+        let cs = try requireCanvas()
+        guard let canvas = cs.active else { return err("No active canvas.") }
+
+        var block: CanvasBlock?
+        if let idStr = strArg(input, "block_id"), let uuid = UUID(uuidString: idStr) {
+            block = canvas.blocks.first { $0.id == uuid }
+        }
+        if block == nil, let title = strArg(input, "block_title") {
+            block = canvas.blocks.first { $0.title.localizedCaseInsensitiveCompare(title) == .orderedSame }
+        }
+        guard let b = block else {
+            let titles = canvas.blocks.map(\.title).joined(separator: ", ")
+            return err("Block not found. Available blocks: \(titles)")
+        }
+        cs.deleteBlock(b.id)
+        return ok(["deleted": b.title, "id": b.id.uuidString],
+                  "Deleted block '\(b.title)' from canvas '\(canvas.name)'")
+    }
+
+    /// Arrange all blocks (or a filtered subset) in a tidy grid layout.
+    private func toolArrangeCanvasGrid(input: [String: AnyCodable]) throws -> ToolResult {
+        let cs = try requireCanvas()
+        guard var canvas = cs.active else { return err("No active canvas.") }
+
+        let cols     = (input["cols"]?.value as? Int) ?? 3
+        let spacingX = dblArg(input, "spacing_x") ?? 40
+        let spacingY = dblArg(input, "spacing_y") ?? 40
+        let startX   = dblArg(input, "start_x") ?? 60
+        let startY   = dblArg(input, "start_y") ?? 60
+
+        // Optionally filter to a specific kind
+        let kindFilter = strArg(input, "kind_filter")
+        var targets = canvas.blocks
+        if let kf = kindFilter {
+            targets = targets.filter { $0.content.kind == kf }
+        }
+        // Sort by current Y then X (top-to-bottom reading order before rearranging)
+        targets.sort { a, b in
+            if abs(a.y - b.y) > 50 { return a.y < b.y }
+            return a.x < b.x
+        }
+
+        // Compute row heights: each row is as tall as the tallest block in that row
+        var col = 0, rowX = startX, rowY = startY
+        var rowMaxH: Double = 0
+        var updated: [(UUID, Double, Double)] = []
+
+        for block in targets {
+            updated.append((block.id, rowX, rowY))
+            rowMaxH = max(rowMaxH, block.h)
+            col += 1
+            if col >= cols {
+                rowY  += rowMaxH + spacingY
+                rowX   = startX
+                rowMaxH = 0
+                col    = 0
+            } else {
+                rowX += block.w + spacingX
+            }
+        }
+
+        // Apply positions
+        for (id, nx, ny) in updated {
+            if let idx = canvas.blocks.firstIndex(where: { $0.id == id }) {
+                canvas.blocks[idx].x = nx
+                canvas.blocks[idx].y = ny
+            }
+        }
+        cs.active = canvas
+        cs.save()
+
+        return ok(["arranged_count": updated.count, "cols": cols,
+                   "canvas": canvas.name],
+                  "Arranged \(updated.count) block(s) in \(cols)-column grid on '\(canvas.name)'")
     }
 
     // MARK: - History Management
@@ -1125,24 +1440,61 @@ class AgentService: ObservableObject {
     - List and activate recipes (batch setpoint downloads to multiple tags)
     - Query historical trend data: min/avg/max/last values over a time range
     - Design and modify HMI screens: create, update, or delete graphical objects on the canvas
+    - **Process Canvas (plant overview spatial layout)**: Full control over canvases and every block on them:
+        - List all canvases and blocks (list_canvases, list_canvas_blocks)
+        - Create / rename canvases for different plant areas (create_canvas, switch_canvas)
+        - Add blocks of any kind: tag monitors, equipment icons, alarm panels, status grids, \
+    trend sparklines, navigation buttons, region labels, HMI screen links (add_canvas_block)
+        - Update block position, size, title, content, colors (update_canvas_block)
+        - Delete blocks (delete_canvas_block)
+        - Auto-arrange all blocks into a tidy matrix/grid layout (arrange_canvas_grid)
     - Navigate the application to relevant views
     - Connect/disconnect the OPC-UA server, control polling
 
+    ## Process Canvas Block Kinds
+    | kind        | key fields                                              |
+    |-------------|--------------------------------------------------------|
+    | tagMonitor  | tag_ids: [tag names] — live value table                |
+    | statusGrid  | tag_ids: [tag names] — colored status tiles            |
+    | alarmPanel  | max_alarms: int — ISA-18.2 active alarm list           |
+    | equipment   | equip_kind: pump/motor/valve/tank/exchanger/compressor, equip_tag_id: status tag |
+    | trendMini   | tag_ids: [tag names], minutes: int — sparkline chart   |
+    | navButton   | nav_label, nav_x, nav_y, nav_scale — viewport jump btn |
+    | region      | text: label, region_color_hex: "#RRGGBB" — area marker |
+    | label       | text: heading text, font_size: pt                      |
+    | hmiScreen   | hmi_screen_id or hmi_screen_name — link to HMI screen  |
+
+    ## Canvas Coordinate System
+    Canvas units = logical points. Origin (0, 0) is top-left. Typical plant overview:
+    - Screen width spans 0–2000+ units, height spans 0–1500+ units
+    - Block sizes: tagMonitor 320×220, equipment 200×200, alarmPanel 420×200, region 500×350
+    - Grid layout: use arrange_canvas_grid to auto-place blocks in rows and columns
+    - Background hex: "#0D1117" (dark), border hex: "#30363D" (subtle)
+    - Equipment color: pumps "#0A1628"/"#1D4ED8", alarms "#1A0A0A"/"#7F1D1D"
+
+    ## Canvas Design Workflow (for layout requests)
+    1. call list_canvases to see what exists
+    2. call list_canvas_blocks to see the current layout
+    3. Add/update/delete blocks as needed
+    4. If user wants a matrix/grid arrangement, call arrange_canvas_grid at the end
+
     ## Rules
     1. ALWAYS use tools to make configuration changes — never just describe what the user should do without actually doing it.
-    2. ALWAYS confirm what you changed after completing tool calls. Be specific: include tag names, values, and IDs.
+    2. ALWAYS confirm what you changed after completing tool calls. Be specific: include block titles, positions, and IDs.
     3. For HMI design tasks: call list_hmi_objects first to understand the current layout, then create or update objects.
-    4. For alarm configuration: verify the tag exists with list_tags or get_tag_detail before configuring.
-    5. When a user provides an image of a desired HMI layout: analyze the visual layout, estimate canvas coordinates \
-    (default canvas is 1280×800), determine object types, colors, and tag bindings, then create the objects one by one.
-    6. Tag names are CASE-SENSITIVE. Always verify with list_tags before referencing a tag name.
-    7. All RGBA color values use doubles in range [0.0, 1.0]. Examples: red={r:1,g:0,b:0,a:1}, \
-    green={r:0,g:1,b:0,a:1}, blue={r:0.27,g:0.51,b:0.71,a:1}, dark background={r:0.08,g:0.08,b:0.12,a:1}.
-    8. This is a safety-critical industrial environment. Be precise. Confirm before making large bulk changes.
-    9. If a tag is not found, say so and list available tags.
-    10. Totalizer tags accumulate value·time automatically; use reset_totalizer to zero them. \
+    4. For canvas design tasks: call list_canvas_blocks first, then add/update/delete blocks.
+    5. For alarm configuration: verify the tag exists with list_tags or get_tag_detail before configuring.
+    6. When a user describes a plant layout (areas, equipment, tags): map it to canvas blocks, choose coordinates \
+    that mirror the physical plant (e.g. feed area top-left, reaction centre, utilities top-right), \
+    then create all blocks. Finish with arrange_canvas_grid if a matrix layout is preferred.
+    7. Tag names are CASE-SENSITIVE. Always verify with list_tags before referencing a tag name.
+    8. All RGBA color values use doubles in range [0.0, 1.0]. Examples: red={r:1,g:0,b:0,a:1}, \
+    green={r:0,g:1,b:0,a:1}, dark background={r:0.08,g:0.08,b:0.12,a:1}.
+    9. This is a safety-critical industrial environment. Be precise. Confirm before making large bulk changes.
+    10. If a tag is not found, say so and list available tags.
+    11. Totalizer tags accumulate value·time automatically; use reset_totalizer to zero them. \
     Source tag must already exist before creating a totalizer.
-    11. For batch writes, the agent is logged as the operator; all writes appear in the Audit Log.
+    12. For batch writes, the agent is logged as the operator; all writes appear in the Audit Log.
     """
 }
 
@@ -1376,7 +1728,115 @@ enum AgentTools {
                                      ] as [String: Any],
                                      "required": ["tag_name", "value"]] as [String: Any]] as [String: Any],
                 "operator_name": str("Operator to record in the write audit log. Default: 'AI Agent'.")
-             ], required: ["writes"])
+             ], required: ["writes"]),
+
+        // ── Process Canvas tools ─────────────────────────────────────────────
+
+        tool("list_canvases",
+             "Lists all Process Canvas documents with name, block count, and active flag.",
+             properties: [:], required: []),
+
+        tool("create_canvas",
+             "Creates a new empty Process Canvas with the given name and makes it active.",
+             properties: ["name": str("Name for the new canvas, e.g. 'Utilities Area'.")],
+             required: []),
+
+        tool("switch_canvas",
+             "Switches the active canvas by name.",
+             properties: ["name": str("Canvas name to activate (case-insensitive).")],
+             required: ["name"]),
+
+        tool("list_canvas_blocks",
+             "Returns all blocks on the active canvas: kind, title, position (x,y), size (w,h), and content fields.",
+             properties: [:], required: []),
+
+        tool("add_canvas_block",
+             "Adds a new block to the active Process Canvas. " +
+             "Block kinds: tagMonitor (live tag table), statusGrid (colored tiles), alarmPanel (ISA-18.2 list), " +
+             "equipment (pump/motor/valve/tank icon), trendMini (sparklines), navButton (viewport jump), " +
+             "region (translucent area label), label (static heading), hmiScreen (link to HMI screen).",
+             properties: [
+                "kind":    strEnum(["tagMonitor","statusGrid","alarmPanel","equipment","trendMini",
+                                    "navButton","region","label","hmiScreen","screenGroup"],
+                                   "Block type to create."),
+                "title":   str("Block title shown in the header bar."),
+                "x":       num("Canvas X position (left edge). Default: 100."),
+                "y":       num("Canvas Y position (top edge). Default: 100."),
+                "w":       num("Width in canvas units. Defaults vary by kind."),
+                "h":       num("Height in canvas units. Defaults vary by kind."),
+                "bg_hex":  str("Background hex color, e.g. '#161B22'. Default: '#161B22'."),
+                "border_hex": str("Border hex color, e.g. '#30363D'. Default: '#30363D'."),
+                // tagMonitor / statusGrid / trendMini
+                "tag_ids": ["type": "array", "items": ["type": "string"] as [String: Any],
+                            "description": "Tag names to display (for tagMonitor, statusGrid, trendMini)."] as [String: Any],
+                "minutes": num("History window in minutes for trendMini. Default: 30."),
+                // alarmPanel
+                "max_alarms": ["type": "integer", "description": "Max alarm rows shown. Default: 5."] as [String: Any],
+                // equipment
+                "equip_kind":   strEnum(["pump","motor","valve","tank","exchanger","compressor"],
+                                        "Equipment icon type."),
+                "equip_tag_id": str("Tag name whose value drives running/stopped color of the equipment icon."),
+                // navButton
+                "nav_label": str("Button label text, e.g. 'Go to Mixing →'."),
+                "nav_x":     num("Canvas X of viewport centre after navigation."),
+                "nav_y":     num("Canvas Y of viewport centre after navigation."),
+                "nav_scale": num("Zoom level after navigation (1.0 = 100%). Default: 1."),
+                // label / region
+                "text":             str("Displayed text for label or region blocks."),
+                "font_size":        num("Font size in points for label blocks. Default: 28."),
+                "region_color_hex": str("Hex tint for region background, e.g. '#1D4ED8'. Default: '#1D4ED8'."),
+                // hmiScreen
+                "hmi_screen_id":   str("UUID string of the linked HMI screen."),
+                "hmi_screen_name": str("Name of the HMI screen to link (alternative to ID).")
+             ], required: ["kind"]),
+
+        tool("update_canvas_block",
+             "Updates properties of an existing canvas block. Locate by block_id (UUID) or block_title.",
+             properties: [
+                "block_id":    str("UUID string from list_canvas_blocks."),
+                "block_title": str("Block title (case-insensitive, alternative to block_id)."),
+                "title":       str("New title."),
+                "x": num("New X."), "y": num("New Y."),
+                "w": num("New width."), "h": num("New height."),
+                "bg_hex":      str("New background hex."),
+                "border_hex":  str("New border hex."),
+                "show_title":  bool("Show/hide the title bar."),
+                "tag_ids": ["type": "array", "items": ["type": "string"] as [String: Any],
+                            "description": "Replace the block's tag list."] as [String: Any],
+                "max_alarms":       ["type": "integer", "description": "Max alarm rows."] as [String: Any],
+                "equip_kind":       str("New equipment icon type."),
+                "equip_tag_id":     str("New status tag for equipment."),
+                "nav_label":        str("New nav button label."),
+                "nav_x":            num("New nav target X."),
+                "nav_y":            num("New nav target Y."),
+                "nav_scale":        num("New nav target scale."),
+                "text":             str("New text for label or region."),
+                "font_size":        num("New font size."),
+                "region_color_hex": str("New region tint hex."),
+                "minutes":          num("New trend window minutes.")
+             ], required: []),
+
+        tool("delete_canvas_block",
+             "Removes a block from the active canvas by title or ID.",
+             properties: [
+                "block_id":    str("UUID from list_canvas_blocks."),
+                "block_title": str("Block title (case-insensitive, alternative to block_id).")
+             ], required: []),
+
+        tool("arrange_canvas_grid",
+             "Rearranges blocks on the active canvas into a tidy grid (matrix) layout. " +
+             "Blocks keep their original size; only their x/y positions are updated. " +
+             "Sort order: current top-to-bottom, left-to-right reading order.",
+             properties: [
+                "cols":        ["type": "integer", "description": "Number of columns. Default: 3."] as [String: Any],
+                "spacing_x":   num("Horizontal gap between blocks. Default: 40."),
+                "spacing_y":   num("Vertical gap between rows. Default: 40."),
+                "start_x":     num("X coordinate of the top-left block. Default: 60."),
+                "start_y":     num("Y coordinate of the top-left block. Default: 60."),
+                "kind_filter": strEnum(["tagMonitor","statusGrid","alarmPanel","equipment","trendMini",
+                                        "navButton","region","label","hmiScreen","screenGroup"],
+                                       "Only rearrange blocks of this kind. Omit to arrange all blocks.")
+             ], required: [])
     ]
 
     // MARK: - Schema builder helpers

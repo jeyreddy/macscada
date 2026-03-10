@@ -73,14 +73,39 @@ struct ProcessCanvasView: View {
 
     // MARK: - Composite HMI view (screen group block tap)
 
-    /// Entries captured when a screenGroup block is tapped in operate mode.
     @State private var compositeEntries: [ScreenGroupEntry] = []
-    /// Column count for the composite grid layout.
     @State private var compositeCols:    Int    = 2
-    /// Title shown in the composite toolbar (taken from the block's title).
     @State private var compositeTitle:   String = ""
-    /// Whether the CompositeHMIView overlay is currently visible.
     @State private var showComposite:    Bool   = false
+
+    // MARK: - Space+drag panning
+
+    /// True while the Space bar is held down — enables pan from any surface (even over blocks).
+    @State private var spaceHeld:    Bool    = false
+    @State private var keyMonitors:  [Any]   = []
+
+    // MARK: - Alarm bubble
+
+    /// Alarm shown in the bubble. nil = bubble not visible.
+    @State private var toastAlarm:       Alarm?  = nil
+    @State private var toastPopping:     Bool    = false
+    @State private var lastAlarmIDs:     Set<UUID> = []
+    /// Cancellable auto-dismiss task — replaced each time a new alarm arrives.
+    @State private var toastDismissTask: Task<Void, Never>? = nil
+
+    // MARK: - Search overlay
+
+    @State private var showSearch:   Bool    = false
+    @State private var searchText:   String  = ""
+
+    // MARK: - Keyboard shortcuts overlay
+
+    @State private var showShortcuts: Bool   = false
+
+    // MARK: - Plant overview navigator (M key)
+
+    @State private var showOverview:  Bool = false
+    @State private var tabNavIndex:   Int  = -1
 
     // MARK: - Body
 
@@ -131,17 +156,26 @@ struct ProcessCanvasView: View {
                 .gesture(
                     DragGesture()
                         .onChanged { v in
-                            // Pan on any background drag (block overlays intercept drags
-                            // that start on a block, so this only fires on empty canvas).
                             if panStartPos == nil {
                                 panStartPos = CGPoint(x: v.startLocation.x, y: v.startLocation.y)
                                 panAtStart  = pan
-                                canvasFocused = true   // grab focus when panning
+                                canvasFocused = true
                             }
                             pan = CGPoint(x: panAtStart.x + v.translation.width,
                                           y: panAtStart.y + v.translation.height)
                         }
-                        .onEnded { _ in panStartPos = nil }
+                        .onEnded { v in
+                            panStartPos = nil
+                            // Momentum: carry 55 % of the predicted extra travel
+                            let momentum = CGPoint(
+                                x: (v.predictedEndTranslation.width  - v.translation.width)  * 0.55,
+                                y: (v.predictedEndTranslation.height - v.translation.height) * 0.55
+                            )
+                            withAnimation(.easeOut(duration: 0.45)) {
+                                pan.x += momentum.x
+                                pan.y += momentum.y
+                            }
+                        }
                 )
 
             // Layer 4: Block views
@@ -173,6 +207,9 @@ struct ProcessCanvasView: View {
                             compositeTitle   = title
                             showComposite    = true
                         },
+
+                        // Double-click → zoom to this block
+                        onZoomTo:  { centerOnBlock(block) },
 
                         // Design-mode callbacks
                         onSelect:  { selectedID = block.id },
@@ -245,10 +282,27 @@ struct ProcessCanvasView: View {
                     Spacer()
                     HStack(alignment: .bottom) {
                         ProcessCanvasMiniMap(
-                            blocks:   blocks,
-                            scale:    scale,
-                            pan:      pan,
-                            viewSize: viewSize
+                            blocks:     blocks,
+                            scale:      scale,
+                            pan:        pan,
+                            viewSize:   viewSize,
+                            alarmState: Dictionary(
+                                uniqueKeysWithValues: blocks.map { b in
+                                    let tagAlarms = (b.content.tagIDs + [b.content.equipTagID])
+                                        .flatMap { alarmManager.getAlarms(forTag: $0) }
+                                    let panelAlarms = b.content.kind == "alarmPanel"
+                                        ? alarmManager.activeAlarms : []
+                                    let all = tagAlarms + panelAlarms
+                                    let severity: MiniMapAlarmSeverity
+                                    if all.contains(where: { $0.severity == .critical }) {
+                                        severity = .critical
+                                    } else if !all.isEmpty {
+                                        severity = .warning
+                                    } else {
+                                        severity = .none
+                                    }
+                                    return (b.id, severity)
+                                })
                         ) { cx, cy in
                             // Navigate viewport centre to tapped canvas point, keep current zoom.
                             animateTo(x: cx, y: cy, scale: Double(scale))
@@ -261,6 +315,72 @@ struct ProcessCanvasView: View {
                 }
                 .allowsHitTesting(true)
                 .ignoresSafeArea()
+            }
+
+            // Layer 10: Space+drag overlay
+            // When Space is held this sits on top of all blocks and captures
+            // the drag gesture — so operators can pan regardless of cursor position.
+            if spaceHeld {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onHover { hovering in
+                        if hovering { NSCursor.openHand.push() } else { NSCursor.pop() }
+                    }
+                    .gesture(
+                        DragGesture()
+                            .onChanged { v in
+                                if panStartPos == nil { panStartPos = .zero; panAtStart = pan }
+                                pan = CGPoint(x: panAtStart.x + v.translation.width,
+                                              y: panAtStart.y + v.translation.height)
+                            }
+                            .onEnded { v in
+                                panStartPos = nil
+                                let m = CGPoint(
+                                    x: (v.predictedEndTranslation.width  - v.translation.width)  * 0.55,
+                                    y: (v.predictedEndTranslation.height - v.translation.height) * 0.55
+                                )
+                                withAnimation(.easeOut(duration: 0.55)) { pan.x += m.x; pan.y += m.y }
+                            }
+                    )
+            }
+
+            // Layer 11: Alarm bubble — 44pt circle, bottom-centre above toolbar.
+            // Shown in Operate mode only; suppressed while the engineer is designing.
+            // Tapping or auto-dismiss triggers a balloon-pop burst animation.
+            if let alarm = toastAlarm, !isDesigning {
+                AlarmBubble(alarm: alarm, popping: $toastPopping) {
+                    toastAlarm   = nil
+                    toastPopping = false
+                }
+                .position(x: viewSize.width / 2, y: viewSize.height - 88)
+                .allowsHitTesting(true)
+                .transition(.scale(scale: 0.1, anchor: .center).combined(with: .opacity))
+            }
+
+            // Layer 12: Search overlay (/)
+            if showSearch {
+                canvasSearchOverlay
+            }
+
+            // Layer 13: Keyboard shortcuts overlay (?)
+            if showShortcuts {
+                shortcutsOverlay
+            }
+
+            // Layer 14: Plant Overview navigator (M key)
+            // Full-screen interactive plant map. Tap any tile to jump there.
+            if showOverview {
+                ProcessCanvasOverview(
+                    blocks:     canvasStore.active?.blocks ?? [],
+                    onNavigate: { block in
+                        withAnimation(.easeInOut(duration: 0.2)) { showOverview = false }
+                        centerOnBlock(block)
+                    },
+                    onDismiss: {
+                        withAnimation(.easeInOut(duration: 0.2)) { showOverview = false }
+                    }
+                )
+                .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .center)))
             }
         }
         .clipped()
@@ -339,9 +459,77 @@ struct ProcessCanvasView: View {
             fitToWindow(size: viewSize); return .handled
         }
 
+        // Search shortcut
+        .onKeyPress(characters: CharacterSet(charactersIn: "/"), phases: .down) { _ in
+            showSearch.toggle(); searchText = ""; return .handled
+        }
+        // Shortcuts reference
+        .onKeyPress(characters: CharacterSet(charactersIn: "?"), phases: .down) { _ in
+            showShortcuts.toggle(); return .handled
+        }
+        // Plant overview (m key)
+        .onKeyPress(characters: CharacterSet(charactersIn: "m"), phases: .down) { _ in
+            withAnimation(.easeInOut(duration: 0.2)) { showOverview.toggle() }
+            return .handled
+        }
+        // Tab: jump to next block in spatial reading order
+        .onKeyPress(.tab, phases: .down) { _ in
+            navigateToNextBlock(); return .handled
+        }
+        // Close overlays on Escape
+        .onKeyPress(.escape, phases: .down) { _ in
+            if showOverview  { withAnimation(.easeInOut(duration: 0.2)) { showOverview  = false }; return .handled }
+            if showSearch    { showSearch    = false; return .handled }
+            if showShortcuts { showShortcuts = false; return .handled }
+            return .ignored
+        }
+
         .onAppear {
             canvasFocused = true
-            startEdgePanTimer()
+            startSpaceMonitor()
+            // Seed known alarms so first-run doesn't immediately toast all existing ones
+            lastAlarmIDs = Set(alarmManager.activeAlarms.map(\.id))
+        }
+        // Reset tab-cycle index when the active canvas changes
+        .onChange(of: canvasStore.activeID) { _, _ in tabNavIndex = -1 }
+        .onDisappear {
+            keyMonitors.forEach { NSEvent.removeMonitor($0) }
+            keyMonitors = []
+        }
+        // Watch for new alarms → show toast.
+        // New alarm → show bubble. Cancels any pending auto-dismiss so rapid alarms
+        // each get their own full 4-second window.
+        .onReceive(alarmManager.$activeAlarms) { alarms in
+            let newAlarms = alarms.filter { !lastAlarmIDs.contains($0.id) }
+            lastAlarmIDs  = Set(alarms.map(\.id))
+            if let newest = newAlarms.first {
+                toastDismissTask?.cancel()
+                toastPopping = false
+                withAnimation(.spring(response: 0.45, dampingFraction: 0.6)) {
+                    toastAlarm = newest
+                }
+                toastDismissTask = Task {
+                    try? await Task.sleep(for: .seconds(4))
+                    guard !Task.isCancelled else { return }
+                    await MainActor.run { toastPopping = true }
+                }
+            }
+        }
+
+        // Delete key (via HMI Editor menu) — removes the selected block in design mode.
+        .onReceive(NotificationCenter.default.publisher(for: .hmiDeleteSelected)) { _ in
+            guard isDesigning, let id = selectedID else { return }
+            canvasStore.deleteBlock(id)
+            selectedID = nil
+        }
+
+        // Clear alarm toast immediately on entering Design mode — no distractions while building.
+        .onChange(of: isDesigning) { _, designing in
+            if designing {
+                toastDismissTask?.cancel()
+                toastAlarm   = nil
+                toastPopping = false
+            }
         }
 
         // Auto-zoom to selected block when selection changes in design mode.
@@ -429,6 +617,19 @@ struct ProcessCanvasView: View {
 
             Spacer()
 
+            // Quick zoom presets
+            ForEach([25, 50, 100], id: \.self) { pct in
+                Button { animateTo(x: (viewSize.width / 2 - pan.x) / scale,
+                                   y: (viewSize.height / 2 - pan.y) / scale,
+                                   scale: Double(pct) / 100) } label: {
+                    Text("\(pct)%").font(.system(size: 10, design: .monospaced))
+                }
+                .buttonStyle(.bordered)
+                .help("Zoom to \(pct)%")
+            }
+
+            Divider().frame(height: 20)
+
             // Zoom percentage indicator
             Text("\(Int(scale * 100))%")
                 .font(.system(size: 11, design: .monospaced))
@@ -442,7 +643,19 @@ struct ProcessCanvasView: View {
                 .buttonStyle(.bordered)
             Button { fitToWindow(size: viewSize) } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
                 .buttonStyle(.bordered)
-                .help("Fit all blocks in the window")
+                .help("Fit all blocks  (f)")
+
+            // Plant overview button
+            Button { withAnimation(.easeInOut(duration: 0.2)) { showOverview.toggle() } } label: {
+                Image(systemName: "map")
+            }
+            .buttonStyle(.bordered)
+            .help("Plant Overview — full map navigator  (m)")
+
+            // Search button
+            Button { showSearch.toggle(); searchText = "" } label: { Image(systemName: "magnifyingglass") }
+                .buttonStyle(.bordered)
+                .help("Search blocks  (/)")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -567,27 +780,225 @@ struct ProcessCanvasView: View {
         }
     }
 
-    // MARK: - Edge auto-pan (operate mode only)
+    // MARK: - Space+drag keyboard monitor
 
-    /// Starts a 60 fps timer that slowly pans the canvas when the cursor approaches
-    /// within 60 pt of any window edge — lets operators scroll large canvases without
-    /// needing to use the trackpad while watching live values.
-    private func startEdgePanTimer() {
-        Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { _ in
-            Task { @MainActor in
-                guard !isDesigning, viewSize != .zero else { return }
-                let margin: CGFloat = 60    // edge zone width in screen points
-                let speed:  CGFloat = 6     // maximum pan pixels per frame at full proximity
-                var dx: CGFloat = 0, dy: CGFloat = 0
-                let m = mouseLocation
-                let s = viewSize
-                // Linear falloff from `speed` at the edge to 0 at `margin` distance.
-                if m.x > 0 && m.x < margin        { dx =  speed * (1 - m.x / margin) }
-                if m.x > s.width - margin          { dx = -speed * (1 - (s.width  - m.x) / margin) }
-                if m.y > 0 && m.y < margin         { dy =  speed * (1 - m.y / margin) }
-                if m.y > s.height - margin         { dy = -speed * (1 - (s.height - m.y) / margin) }
-                if dx != 0 || dy != 0 { pan.x += dx; pan.y += dy }
+    private func startSpaceMonitor() {
+        let down = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if event.keyCode == 49 && !event.isARepeat { // Space
+                Task { @MainActor in spaceHeld = true }
             }
+            return event
+        }
+        let up = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { event in
+            if event.keyCode == 49 { // Space
+                Task { @MainActor in spaceHeld = false }
+            }
+            return event
+        }
+        if let d = down { keyMonitors.append(d) }
+        if let u = up   { keyMonitors.append(u) }
+    }
+
+    // MARK: - Search overlay
+
+    private var canvasSearchOverlay: some View {
+        VStack {
+            HStack {
+                Spacer()
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass").foregroundColor(.secondary)
+                        TextField("Search blocks…", text: $searchText)
+                            .textFieldStyle(.plain)
+                            .font(.body)
+                            .foregroundColor(.white)
+                            .onSubmit { navigateToFirstMatch() }
+                        if !searchText.isEmpty {
+                            Button { searchText = "" } label: {
+                                Image(systemName: "xmark.circle.fill").foregroundColor(.secondary)
+                            }.buttonStyle(.plain)
+                        }
+                        Button { showSearch = false; searchText = "" } label: {
+                            Image(systemName: "xmark").foregroundColor(.secondary)
+                        }.buttonStyle(.plain)
+                    }
+                    .padding(10)
+                    .background(.regularMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.white.opacity(0.1), lineWidth: 0.5))
+
+                    // Search results
+                    let results = searchResults
+                    if !results.isEmpty && !searchText.isEmpty {
+                        VStack(alignment: .leading, spacing: 0) {
+                            ForEach(results.prefix(6)) { block in
+                                Button {
+                                    centerOnBlock(block)
+                                    showSearch = false; searchText = ""
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: blockIcon(for: block))
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                            .frame(width: 16)
+                                        Text(block.title)
+                                            .font(.caption)
+                                            .foregroundColor(.white)
+                                            .lineLimit(1)
+                                        Spacer()
+                                        Text(block.content.kind)
+                                            .font(.system(size: 9))
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .background(Color.white.opacity(0.03))
+                                if block.id != results.prefix(6).last?.id { Divider() }
+                            }
+                        }
+                        .background(.regularMaterial)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay(RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.white.opacity(0.1), lineWidth: 0.5))
+                        .padding(.top, 4)
+                    }
+                }
+                .frame(width: 320)
+                .padding(.top, 14)
+                .padding(.trailing, 14)
+            }
+            Spacer()
+        }
+    }
+
+    private var searchResults: [CanvasBlock] {
+        guard !searchText.isEmpty, let blocks = canvasStore.active?.blocks else { return [] }
+        let q = searchText.lowercased()
+        return blocks.filter {
+            $0.title.lowercased().contains(q) ||
+            $0.content.tagIDs.contains { $0.lowercased().contains(q) } ||
+            $0.content.equipTagID.lowercased().contains(q) ||
+            $0.content.hmiScreenName.lowercased().contains(q)
+        }
+    }
+
+    private func navigateToFirstMatch() {
+        if let first = searchResults.first { centerOnBlock(first) }
+        showSearch = false; searchText = ""
+    }
+
+    // MARK: - Tab-key spatial navigation
+
+    /// Cycle to the next block in spatial reading order (top-to-bottom, left-to-right within each row).
+    /// Wraps around when the last block is reached. Zooms the viewport to the target block.
+    private func navigateToNextBlock() {
+        guard let blocks = canvasStore.active?.blocks, !blocks.isEmpty else { return }
+        // Sort into rows: group blocks whose Y centres are within 80 pt of each other,
+        // then sort rows top-to-bottom and within each row left-to-right.
+        let sorted = blocks.sorted { a, b in
+            let rowA = (a.y / 80).rounded(.towardZero)
+            let rowB = (b.y / 80).rounded(.towardZero)
+            if rowA != rowB { return rowA < rowB }
+            return a.x < b.x
+        }
+        tabNavIndex = (tabNavIndex + 1) % sorted.count
+        let target  = sorted[tabNavIndex]
+        selectedID  = target.id
+        centerOnBlock(target)
+    }
+
+    private func blockIcon(for block: CanvasBlock) -> String {
+        switch block.content.kind {
+        case "tagMonitor":  return "list.bullet"
+        case "statusGrid":  return "square.grid.2x2"
+        case "alarmPanel":  return "exclamationmark.triangle"
+        case "equipment":   return "gearshape"
+        case "trendMini":   return "chart.xyaxis.line"
+        case "navButton":   return "arrow.right.circle"
+        case "hmiScreen":   return "rectangle.on.rectangle"
+        case "screenGroup": return "square.grid.2x2"
+        case "region":      return "rectangle.dashed"
+        default:            return "square"
+        }
+    }
+
+    // MARK: - Keyboard shortcuts overlay
+
+    private var shortcutsOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.55).ignoresSafeArea()
+                .onTapGesture { showShortcuts = false }
+
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Text("Keyboard Shortcuts")
+                        .font(.headline.bold())
+                        .foregroundColor(.white)
+                    Spacer()
+                    Button { showShortcuts = false } label: {
+                        Image(systemName: "xmark").foregroundColor(.secondary)
+                    }.buttonStyle(.plain)
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 18)
+                .padding(.bottom, 12)
+
+                Divider()
+
+                let shortcuts: [(String, String)] = [
+                    ("Arrow keys",        "Pan canvas (50 pt)"),
+                    ("⇧ + Arrow keys",    "Pan fast (200 pt)"),
+                    ("=  /  +",           "Zoom in ×1.25"),
+                    ("-",                 "Zoom out ×0.8"),
+                    ("f  or  0",          "Fit all blocks to window"),
+                    ("Space + drag",      "Pan from anywhere (even over blocks)"),
+                    ("Double-click block","Zoom into that block"),
+                    ("Tab",               "Jump to next block (spatial order)"),
+                    ("m",                 "Plant Overview — full map navigator"),
+                    ("/",                 "Search blocks and tags"),
+                    ("?",                 "Show this shortcuts reference"),
+                    ("Esc",               "Close overview / search / shortcuts"),
+                    ("Right-click block", "Context menu (Zoom, Open Screen…)"),
+                ]
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(shortcuts, id: \.0) { key, desc in
+                            HStack(alignment: .center, spacing: 16) {
+                                Text(key)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundColor(.white)
+                                    .frame(width: 160, alignment: .leading)
+                                Text(desc)
+                                    .font(.system(size: 12))
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 7)
+                            if key != shortcuts.last?.0 {
+                                Divider().padding(.leading, 20)
+                            }
+                        }
+                    }
+                }
+
+                Divider()
+                Text("Press any key or click outside to dismiss")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .center)
+            }
+            .background(.regularMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14)
+                .stroke(Color.white.opacity(0.1), lineWidth: 0.5))
+            .frame(width: 440)
+            .shadow(color: .black.opacity(0.5), radius: 30)
         }
     }
 }
@@ -685,6 +1096,12 @@ struct CanvasScrollCapture: NSViewRepresentable {
     }
 }
 
+// MARK: - MiniMapAlarmSeverity
+
+/// Alarm severity level used by ProcessCanvasMiniMap for colour coding.
+/// .none = no alarm (white), .warning = unack/active (orange), .critical = critical active (red).
+enum MiniMapAlarmSeverity { case none, warning, critical }
+
 // MARK: - ProcessCanvasMiniMap
 //
 // A 180×112-pt thumbnail of the entire canvas shown in the bottom-left corner.
@@ -698,17 +1115,18 @@ struct CanvasScrollCapture: NSViewRepresentable {
 //   toCanvas(mx,my)— minimap pixel → canvas centre
 
 struct ProcessCanvasMiniMap: View {
-    let blocks:    [CanvasBlock]
-    let scale:     CGFloat
-    let pan:       CGPoint
-    let viewSize:  CGSize
+    let blocks:     [CanvasBlock]
+    let scale:      CGFloat
+    let pan:        CGPoint
+    let viewSize:   CGSize
+    /// Per-block alarm severity keyed by block ID — drives mini-map colour coding.
+    let alarmState: [UUID: MiniMapAlarmSeverity]
     var onNavigate: (Double, Double) -> Void
 
-    private let mapW:     CGFloat = 180
-    private let mapH:     CGFloat = 112
-    private let mapPad:   CGFloat = 6
+    private let mapW:   CGFloat = 180
+    private let mapH:   CGFloat = 112
+    private let mapPad: CGFloat = 6
 
-    // Bounding box of all content with a comfortable margin.
     private var contentBounds: CGRect {
         guard !blocks.isEmpty else { return CGRect(x: 0, y: 0, width: 1280, height: 800) }
         let minX = blocks.map { $0.x }.min()! - 200
@@ -718,56 +1136,53 @@ struct ProcessCanvasMiniMap: View {
         return CGRect(x: minX, y: minY, width: max(maxX - minX, 1), height: max(maxY - minY, 1))
     }
 
-    // Uniform scale: canvas → minimap pixels.
     private var mapScale: CGFloat {
         min((mapW - mapPad * 2) / contentBounds.width,
             (mapH - mapPad * 2) / contentBounds.height)
     }
 
     private func toMap(_ cx: Double, _ cy: Double) -> CGPoint {
-        CGPoint(
-            x: (cx - contentBounds.minX) * mapScale + mapPad,
-            y: (cy - contentBounds.minY) * mapScale + mapPad
-        )
+        CGPoint(x: (cx - contentBounds.minX) * mapScale + mapPad,
+                y: (cy - contentBounds.minY) * mapScale + mapPad)
     }
 
     private func toCanvas(_ mx: CGFloat, _ my: CGFloat) -> (Double, Double) {
-        let cx = (mx - mapPad) / mapScale + contentBounds.minX
-        let cy = (my - mapPad) / mapScale + contentBounds.minY
-        return (Double(cx), Double(cy))
+        ((mx - mapPad) / mapScale + contentBounds.minX,
+         (my - mapPad) / mapScale + contentBounds.minY)
     }
 
-    // The visible viewport expressed as a rectangle in minimap space.
     private var viewportRect: CGRect {
         guard viewSize != .zero, scale > 0 else { return .zero }
-        let vpMinX = -pan.x / scale
-        let vpMinY = -pan.y / scale
-        let vpMaxX = (viewSize.width  - pan.x) / scale
-        let vpMaxY = (viewSize.height - pan.y) / scale
-        let tl = toMap(Double(vpMinX), Double(vpMinY))
-        let br = toMap(Double(vpMaxX), Double(vpMaxY))
+        let tl = toMap(Double(-pan.x / scale),                      Double(-pan.y / scale))
+        let br = toMap(Double((viewSize.width - pan.x) / scale),    Double((viewSize.height - pan.y) / scale))
         return CGRect(x: tl.x, y: tl.y, width: br.x - tl.x, height: br.y - tl.y)
     }
 
     var body: some View {
         Canvas { ctx, _ in
-            // Draw each block as a small filled rect.
+            // Alarm-colour-coded block thumbnails
             for block in blocks {
                 let tl   = toMap(block.x, block.y)
                 let br   = toMap(block.x + block.w, block.y + block.h)
                 let rect = CGRect(x: tl.x, y: tl.y,
                                   width: max(br.x - tl.x, 1), height: max(br.y - tl.y, 1))
+                // Color: red = critical alarm, orange = warning alarm, white = normal
+                let fillColor: Color
+                switch alarmState[block.id] ?? .none {
+                case .critical: fillColor = .red
+                case .warning:  fillColor = .orange
+                case .none:     fillColor = .white
+                }
                 ctx.fill(Path(roundedRect: rect, cornerRadius: 1),
-                         with: .color(.white.opacity(0.55)))
+                         with: .color(fillColor.opacity(0.55)))
             }
-            // Draw the current viewport rectangle.
+            // Viewport rectangle
             let vp = viewportRect
             if vp.width > 1 && vp.height > 1 {
                 let clipped = CGRect(
                     x: max(vp.minX, mapPad - 1), y: max(vp.minY, mapPad - 1),
                     width:  min(vp.width,  mapW - mapPad * 2 + 2),
-                    height: min(vp.height, mapH - mapPad * 2 + 2)
-                )
+                    height: min(vp.height, mapH - mapPad * 2 + 2))
                 ctx.fill(Path(clipped), with: .color(.blue.opacity(0.12)))
                 ctx.stroke(Path(clipped), with: .color(.cyan.opacity(0.85)), lineWidth: 1.0)
             }
@@ -868,6 +1283,11 @@ final class _CanvasNSView: NSView {
         onZoom?(factor, flippedLoc(event))
     }
 
+    /// Two-finger double-tap on trackpad → fit all blocks to window.
+    override func smartMagnify(with event: NSEvent) {
+        onFit?()
+    }
+
     override func mouseMoved(with event: NSEvent) {
         onMouseMove?(flippedLoc(event))
     }
@@ -876,5 +1296,378 @@ final class _CanvasNSView: NSView {
     private func flippedLoc(_ event: NSEvent) -> CGPoint {
         let p = convert(event.locationInWindow, from: nil)
         return CGPoint(x: p.x, y: p.y)   // isFlipped=true already inverts Y
+    }
+}
+
+// MARK: - ProcessCanvasOverview
+//
+// Full-screen interactive plant map navigator, shown by pressing 'M' or the toolbar
+// Map button. All blocks are rendered as labelled tiles preserving their spatial layout.
+// Tap any tile to dismiss the overlay and fly the viewport to that block.
+// Supports live text filtering so operators can quickly locate a block by name or type.
+
+private struct ProcessCanvasOverview: View {
+
+    let blocks:     [CanvasBlock]
+    let onNavigate: (CanvasBlock) -> Void
+    let onDismiss:  () -> Void
+
+    @State private var filterText:    String = ""
+    @FocusState private var sfFocused: Bool
+
+    // MARK: - Filtered results
+
+    private var filtered: Set<UUID> {
+        guard !filterText.isEmpty else { return Set(blocks.map(\.id)) }
+        let q = filterText.lowercased()
+        return Set(blocks.filter {
+            $0.title.lowercased().contains(q) ||
+            $0.content.kind.lowercased().contains(q) ||
+            $0.content.tagIDs.contains { $0.lowercased().contains(q) } ||
+            $0.content.equipTagID.lowercased().contains(q)
+        }.map(\.id))
+    }
+
+    // MARK: - Coordinate helpers
+
+    private var contentBounds: CGRect {
+        guard !blocks.isEmpty else { return CGRect(x: 0, y: 0, width: 1280, height: 800) }
+        let minX = blocks.map { $0.x }.min()! - 120
+        let minY = blocks.map { $0.y }.min()! - 120
+        let maxX = blocks.map { $0.x + $0.w }.max()! + 120
+        let maxY = blocks.map { $0.y + $0.h }.max()! + 120
+        return CGRect(x: minX, y: minY,
+                      width: max(maxX - minX, 1), height: max(maxY - minY, 1))
+    }
+
+    /// Canvas rect → screen rect within `mapSize`, preserving aspect ratio and centring.
+    private func tileRect(_ block: CanvasBlock, in mapSize: CGSize) -> CGRect {
+        let b = contentBounds
+        let s = min(mapSize.width / b.width, mapSize.height / b.height)
+        let offX = (mapSize.width  - b.width  * s) / 2
+        let offY = (mapSize.height - b.height * s) / 2
+        return CGRect(
+            x: (block.x - b.minX) * s + offX,
+            y: (block.y - b.minY) * s + offY,
+            width:  max(block.w * s, 4),
+            height: max(block.h * s, 4)
+        )
+    }
+
+    // MARK: - Block colour coding
+
+    private func blockColor(_ block: CanvasBlock) -> Color {
+        switch block.content.kind {
+        case "tagMonitor":  return .blue
+        case "statusGrid":  return .teal
+        case "alarmPanel":  return .red
+        case "equipment":   return .green
+        case "trendMini":   return .purple
+        case "navButton":   return .indigo
+        case "hmiScreen":   return .cyan
+        case "screenGroup": return .mint
+        case "region":      return .gray.opacity(0.6)
+        default:            return .white
+        }
+    }
+
+    // MARK: - Legend items
+
+    private static let legend: [(String, Color)] = [
+        ("Tag Monitor", .blue),
+        ("Equipment",   .green),
+        ("Alarms",      .red),
+        ("Trend",       .purple),
+        ("HMI Screen",  .cyan),
+        ("Region",      .gray),
+    ]
+
+    // MARK: - Body
+
+    var body: some View {
+        ZStack {
+            // Dimmed backdrop — tap outside the panel to dismiss
+            Color.black.opacity(0.75)
+                .ignoresSafeArea()
+                .onTapGesture { onDismiss() }
+
+            VStack(spacing: 0) {
+
+                // ── Header ──────────────────────────────────────────────────
+                HStack(spacing: 12) {
+                    Image(systemName: "map.fill")
+                        .font(.title3)
+                        .foregroundColor(.cyan)
+                    Text("Plant Overview")
+                        .font(.headline.bold())
+                        .foregroundColor(.white)
+                    Text("·  \(blocks.count) blocks")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    // Filter field
+                    HStack(spacing: 6) {
+                        Image(systemName: "magnifyingglass")
+                            .foregroundColor(.secondary)
+                            .font(.caption)
+                        TextField("Filter blocks…", text: $filterText)
+                            .textFieldStyle(.plain)
+                            .font(.caption)
+                            .foregroundColor(.white)
+                            .focused($sfFocused)
+                            .frame(width: 160)
+                        if !filterText.isEmpty {
+                            Button { filterText = "" } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundColor(.secondary)
+                                    .font(.caption)
+                            }.buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(.white.opacity(0.08))
+                    .clipShape(Capsule())
+
+                    Button { onDismiss() } label: {
+                        Image(systemName: "xmark")
+                            .foregroundColor(.secondary)
+                    }.buttonStyle(.plain)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 14)
+                .background(.black.opacity(0.25))
+
+                Divider().opacity(0.25)
+
+                // ── Map area ─────────────────────────────────────────────────
+                GeometryReader { geo in
+                    let pad: CGFloat = 20
+                    let mapSize = CGSize(width: geo.size.width  - pad * 2,
+                                        height: geo.size.height - pad * 2)
+                    let match = filtered   // capture for use in ForEach
+
+                    ZStack(alignment: .topLeading) {
+                        // Subtle dot-grid backdrop
+                        Canvas { ctx, size in
+                            let gs: CGFloat = 32
+                            var x: CGFloat = 0
+                            while x <= size.width {
+                                ctx.stroke(Path { p in
+                                    p.move(to: .init(x: x, y: 0))
+                                    p.addLine(to: .init(x: x, y: size.height))
+                                }, with: .color(.white.opacity(0.035)))
+                                x += gs
+                            }
+                            var y: CGFloat = 0
+                            while y <= size.height {
+                                ctx.stroke(Path { p in
+                                    p.move(to: .init(x: 0, y: y))
+                                    p.addLine(to: .init(x: size.width, y: y))
+                                }, with: .color(.white.opacity(0.035)))
+                                y += gs
+                            }
+                        }
+                        .frame(width: mapSize.width, height: mapSize.height)
+                        .offset(x: pad, y: pad)
+
+                        // Block tiles
+                        ForEach(blocks) { block in
+                            let r       = tileRect(block, in: mapSize)
+                            let active  = match.contains(block.id)
+                            let dimmed  = !filterText.isEmpty && !active
+                            let color   = blockColor(block)
+
+                            Button { onNavigate(block) } label: {
+                                ZStack {
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .fill(color.opacity(dimmed ? 0.05 : 0.28))
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .stroke(color.opacity(dimmed ? 0.12 : (active && !filterText.isEmpty ? 0.95 : 0.70)),
+                                                lineWidth: active && !filterText.isEmpty ? 1.5 : 0.75)
+
+                                    if r.width > 32 && r.height > 14 {
+                                        VStack(spacing: 1) {
+                                            Text(block.title)
+                                                .font(.system(size: min(r.height * 0.22, 11), weight: .medium))
+                                                .foregroundColor(.white.opacity(dimmed ? 0.20 : 0.92))
+                                                .lineLimit(2)
+                                                .multilineTextAlignment(.center)
+                                            if r.height > 28 {
+                                                Text(block.content.kind)
+                                                    .font(.system(size: min(r.height * 0.15, 9)))
+                                                    .foregroundColor(.secondary.opacity(dimmed ? 0.15 : 0.75))
+                                            }
+                                        }
+                                        .padding(3)
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .frame(width: r.width, height: r.height)
+                            // .position centres the view — offset from ZStack top-left by pad
+                            .position(x: r.midX + pad, y: r.midY + pad)
+                        }
+                    }
+                    .frame(width: geo.size.width, height: geo.size.height)
+                }
+                .padding(.vertical, 6)
+
+                Divider().opacity(0.25)
+
+                // ── Footer / legend ───────────────────────────────────────────
+                HStack(spacing: 14) {
+                    ForEach(ProcessCanvasOverview.legend, id: \.0) { label, color in
+                        HStack(spacing: 4) {
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(color.opacity(0.65))
+                                .frame(width: 10, height: 10)
+                            Text(label)
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    Spacer()
+                    Text("Tap a block to navigate  ·  Esc or M to close")
+                        .font(.caption2)
+                        .foregroundColor(.secondary.opacity(0.55))
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+                .background(.black.opacity(0.25))
+            }
+            .background(.regularMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(.white.opacity(0.08), lineWidth: 0.5)
+            )
+            .shadow(color: .black.opacity(0.55), radius: 40)
+            .padding(36)
+            // Prevent tap-on-panel from bubbling up to the dismiss backdrop
+            .contentShape(RoundedRectangle(cornerRadius: 16))
+            .onTapGesture { /* absorb — blocks the backdrop dismiss */ }
+        }
+        .onAppear { sfFocused = true }
+    }
+}
+
+// MARK: - AlarmBubble
+//
+// A ~44pt circular alarm indicator placed bottom-centre of the canvas.
+// Dismissal plays a balloon-pop effect:
+//   1. The circle inflates to 1.35× and fades (0.22s)
+//   2. A shockwave ring expands from 1× to 2.6× and fades (0.38s)
+//   3. Six dots scatter 30pt outward and fade (0.38s)
+//   4. onDismiss() is called after the animations finish.
+//
+// The bubble also pulses a soft glow ring to attract attention while live.
+
+private struct AlarmBubble: View {
+    let alarm:    Alarm
+    @Binding var popping: Bool
+    let onDismiss: () -> Void
+
+    private let size: CGFloat = 44
+
+    @State private var glowScale:     CGFloat = 1.0
+    @State private var glowOpacity:   Double  = 0.5
+    @State private var bubbleScale:   CGFloat = 1.0
+    @State private var bubbleOpacity: Double  = 1.0
+    @State private var ringScale:     CGFloat = 1.0
+    @State private var ringOpacity:   Double  = 0.0
+    @State private var burstRadius:   CGFloat = 0.0
+    @State private var burstOpacity:  Double  = 0.0
+
+    private var color: Color { alarm.severity == .critical ? .red : .orange }
+
+    var body: some View {
+        ZStack {
+            // Burst dots — 6 dots at 60° intervals, scatter on pop
+            ForEach(0..<6, id: \.self) { i in
+                let angle = Double(i) * 60.0 * .pi / 180
+                Circle()
+                    .fill(color)
+                    .frame(width: 7, height: 7)
+                    .offset(x: burstRadius * CGFloat(cos(angle)),
+                            y: burstRadius * CGFloat(sin(angle)))
+                    .opacity(burstOpacity)
+            }
+
+            // Shockwave ring — expands outward on pop
+            Circle()
+                .strokeBorder(color.opacity(ringOpacity), lineWidth: 2.5)
+                .frame(width: size, height: size)
+                .scaleEffect(ringScale)
+
+            // Ambient glow pulse — animates continuously while bubble is alive
+            Circle()
+                .strokeBorder(color.opacity(glowOpacity), lineWidth: 2)
+                .frame(width: size, height: size)
+                .scaleEffect(glowScale)
+
+            // Main bubble
+            Circle()
+                .fill(color)
+                .frame(width: size, height: size)
+                .overlay {
+                    Image(systemName: "exclamationmark")
+                        .font(.system(size: 17, weight: .black))
+                        .foregroundColor(.white)
+                }
+                .shadow(color: color.opacity(0.55), radius: 6)
+                .scaleEffect(bubbleScale)
+                .opacity(bubbleOpacity)
+        }
+        // Frame large enough to contain the burst dots at peak travel
+        .frame(width: size + 80, height: size + 80)
+        .contentShape(Circle().size(CGSize(width: size, height: size)))
+        .onTapGesture { triggerPop() }
+        .onAppear { startGlow() }
+        .onChange(of: popping) { _, shouldPop in
+            if shouldPop { triggerPop() }
+        }
+    }
+
+    // MARK: - Glow pulse (repeating, while bubble is alive)
+
+    private func startGlow() {
+        withAnimation(.easeInOut(duration: 0.85).repeatForever(autoreverses: false)) {
+            glowScale   = 1.75
+            glowOpacity = 0.0
+        }
+    }
+
+    // MARK: - Balloon pop
+
+    private func triggerPop() {
+        guard bubbleOpacity > 0 else { return }   // prevent double-trigger
+
+        // Shockwave ring: flash visible then expand + fade
+        ringOpacity = 0.85
+        ringScale   = 1.0
+        withAnimation(.easeOut(duration: 0.38)) {
+            ringScale   = 2.6
+            ringOpacity = 0.0
+        }
+
+        // Burst dots: appear then scatter outward and fade
+        burstOpacity = 0.9
+        burstRadius  = 0.0
+        withAnimation(.easeOut(duration: 0.38)) {
+            burstRadius  = 32
+            burstOpacity = 0.0
+        }
+
+        // Main bubble: inflate slightly then vanish
+        withAnimation(.easeIn(duration: 0.22)) {
+            bubbleScale   = 1.35
+            bubbleOpacity = 0.0
+        }
+
+        // Notify parent after all animations finish
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.42) {
+            onDismiss()
+        }
     }
 }

@@ -129,6 +129,7 @@ class DataService: ObservableObject {
 
         // Wire Phase 12 agent power tools — property injection avoids circular init.
         self.agentService.recipeStore  = recipes
+        self.agentService.canvasStore  = self.processCanvasStore
         // Wire scheduler → recipeStore after both are created
         self.schedulerService.recipeStore = recipes
         self.agentService.confirmWrite = { [weak self] req in

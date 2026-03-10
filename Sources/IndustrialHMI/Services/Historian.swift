@@ -87,10 +87,12 @@ actor Historian {
     private let tcUnit       = Expression<String?>("unit")
     private let tcDesc       = Expression<String?>("description")
     private let tcAddedAt    = Expression<Int64>("added_at")
-    private let tcExpression     = Expression<String?>("expression")
-    private let tcOnLabel        = Expression<String?>("on_label")
-    private let tcOffLabel       = Expression<String?>("off_label")
-    private let tcCompositeJSON  = Expression<String?>("composite_json")
+    private let tcExpression          = Expression<String?>("expression")
+    private let tcOnLabel             = Expression<String?>("on_label")
+    private let tcOffLabel            = Expression<String?>("off_label")
+    private let tcCompositeJSON       = Expression<String?>("composite_json")
+    /// 1 = log to historian, 0 = skip. Stored as INTEGER for SQLite compatibility.
+    private let tcHistorianEnabled    = Expression<Int>("historian_enabled")
 
     // MARK: - alarm_configs table
 
@@ -249,6 +251,8 @@ actor Historian {
         _ = try? db.run("ALTER TABLE tag_configs ADD COLUMN on_label TEXT")
         _ = try? db.run("ALTER TABLE tag_configs ADD COLUMN off_label TEXT")
         _ = try? db.run("ALTER TABLE tag_configs ADD COLUMN composite_json TEXT")
+        // Migration: per-tag historian opt-in flag (DEFAULT 1 = enabled for all existing tags)
+        _ = try? db.run("ALTER TABLE tag_configs ADD COLUMN historian_enabled INTEGER NOT NULL DEFAULT 1")
 
         // alarm_configs
         try db.run(alarmConfigs.create(ifNotExists: true) { t in
@@ -526,16 +530,17 @@ actor Historian {
         }()
         try db.run(tagConfigs.insert(
             or: .replace,
-            tcName          <- tag.name,
-            tcNodeId        <- tag.nodeId,
-            tcDataType      <- tag.dataType.rawValue,
-            tcUnit          <- tag.unit,
-            tcDesc          <- tag.description,
-            tcAddedAt       <- tsMs,
-            tcExpression    <- tag.expression,
-            tcOnLabel       <- tag.onLabel,
-            tcOffLabel      <- tag.offLabel,
-            tcCompositeJSON <- compositeJSON
+            tcName             <- tag.name,
+            tcNodeId           <- tag.nodeId,
+            tcDataType         <- tag.dataType.rawValue,
+            tcUnit             <- tag.unit,
+            tcDesc             <- tag.description,
+            tcAddedAt          <- tsMs,
+            tcExpression       <- tag.expression,
+            tcOnLabel          <- tag.onLabel,
+            tcOffLabel         <- tag.offLabel,
+            tcCompositeJSON    <- compositeJSON,
+            tcHistorianEnabled <- (tag.historianEnabled ? 1 : 0)
         ))
     }
 
@@ -554,6 +559,8 @@ actor Historian {
                     compositeAggregation = CompositeAggregation(rawValue: payload.aggregation)
                 }
             }
+            // historian_enabled column defaults to 1 (true) for rows added before migration
+            let historianEnabledInt = (try? row.get(tcHistorianEnabled)) ?? 1
             return Tag(
                 name:                row[tcName],
                 nodeId:              row[tcNodeId],
@@ -564,7 +571,8 @@ actor Historian {
                 onLabel:             row[tcOnLabel],
                 offLabel:            row[tcOffLabel],
                 compositeMembers:    compositeMembers,
-                compositeAggregation: compositeAggregation
+                compositeAggregation: compositeAggregation,
+                historianEnabled:    historianEnabledInt != 0
             )
         }
     }
